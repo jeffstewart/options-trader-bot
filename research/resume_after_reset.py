@@ -14,9 +14,9 @@ Run:  .venv/bin/python spawn_daemon.py resume_after_reset.pid resume_after_reset
 import os, sys, json, time, subprocess
 from datetime import datetime, timezone, timedelta
 
-DIR = "/Users/jeff/Claude/Trader"
-CACHE = os.path.join(DIR, "groq_primary_backtest_cache.json")
-STOP = os.path.join(DIR, "resume_after_reset.stop")
+DIR = "/Users/jeff/Claude/Trader"                       # 2026-06-24 restructure: code in core/+research/,
+CACHE = os.path.join(DIR, "data", "groq_primary_backtest_cache.json")   # data/caches, logs/logs
+STOP = os.path.join(DIR, "data", "resume_after_reset.stop")
 PY = os.path.join(DIR, ".venv/bin/python")
 TOTAL_PER_MODEL = 1900                 # universe ~1906; treat ≥this as complete (a few articles drop out)
 # Completion gates on 8b + gpt-oss-120b — scout dropped (deprecation), 70b can't finish on free tier.
@@ -49,8 +49,12 @@ def kill_backtest():
 
 def launch_backtest():
     env = dict(os.environ, USE_YAHOO_BARS="1")
-    subprocess.run([PY, "spawn_daemon.py", "groq_backtest.pid", "groq_backtest.log",
-                    PY, "-u", "groq_vs_ollama_backtest.py"], cwd=DIR, env=env)
+    # spawn_daemon (core/) sets CWD=data/, so the backtest's bare cache refs resolve into data/.
+    subprocess.run([PY, os.path.join(DIR, "core", "spawn_daemon.py"),
+                    os.path.join(DIR, "data", "groq_backtest.pid"),
+                    os.path.join(DIR, "logs", "groq_backtest.log"),
+                    PY, "-u", os.path.join(DIR, "research", "groq_vs_ollama_backtest.py")],
+                   cwd=os.path.join(DIR, "data"), env=env)
 
 
 def next_reset(now):

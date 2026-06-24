@@ -30,15 +30,17 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from dotenv import load_dotenv
 import router_eval   # shared shadow-router attribution logic
+import config        # for LOG_DIR (logs live outside the data/ CWD)
 
 load_dotenv()
 
 app = Flask(__name__)
 
+# Data files (CSVs, state) resolve via the daemon's CWD=data/; the bot LOG lives in logs/.
 TRADES_CSV         = Path("trades.csv")
 CLOSED_TRADES_CSV  = Path("closed_trades.csv")
 ROUTER_DECISIONS_CSV = Path("router_decisions.csv")
-BOT_LOG            = Path("bot.log")
+BOT_LOG            = config.LOG_DIR / "bot.log"
 BOT_STATE_FILE     = Path("bot_state.json")
 BOT_PROCESS        = "bot.py"
 PORT               = int(os.environ.get("DASHBOARD_PORT", 5001))

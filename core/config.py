@@ -8,9 +8,17 @@ Credentials are loaded from .env — never hardcode keys here.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── Project paths (2026-06-24 restructure: code in core/+research/, data in data/, logs in logs/) ──
+# config.py lives in core/, so the project root is two levels up. Daemons run with CWD=data/ (set in
+# spawn_daemon.py) so the codebase's bare data-file refs (open("foo.json")) resolve into data/.
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"      # model-score caches, price-bar caches, CSVs, bot_state.json
+LOG_DIR  = BASE_DIR / "logs"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS  (loaded from .env)
