@@ -1,0 +1,12 @@
+import os, subprocess, time, datetime, zoneinfo
+ET = zoneinfo.ZoneInfo("America/New_York")
+def log(m): print(f"{datetime.datetime.now(ET):%H:%M:%S} ET  {m}", flush=True)
+now = datetime.datetime.now(ET)
+tgt = now.replace(hour=16, minute=5, second=0, microsecond=0)
+if now >= tgt: tgt += datetime.timedelta(days=1)
+secs = (tgt - now).total_seconds()
+log(f"waiting {int(secs/60)}min until {tgt:%H:%M ET} then running prompt refinement sweep")
+time.sleep(max(0, secs))
+log("market closed — starting refinement sweep")
+subprocess.run(["./run_prompt_refinement.sh"])
+log("done")

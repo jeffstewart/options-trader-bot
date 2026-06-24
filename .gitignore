@@ -1,0 +1,48 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Logs (75+ here, incl. multi-GB bot.log/dashboard.log) ─────────────────
+*.log
+
+# ── Process state / pids ──────────────────────────────────────────────────
+*.pid
+*.stop
+
+# ── Data: model scores, price-bar caches, backtest caches (large, regenerable)
+*.json
+# (all .json in this project are caches/state — bot_state.json, *_cache.json,
+#  unified_scores.json, dual_score_cache.json, etc. Re-derivable, machine-local.)
+
+# ── Trade data / CSV outputs (live trade history is machine-local data) ───
+*.csv
+
+# ── Generated reports ─────────────────────────────────────────────────────
+*.html
+
+# ── Old backtest outputs & backups ────────────────────────────────────────
+*.out
+*.bak
+*.bak*
+
+# ── Generated EOD reports ─────────────────────────────────────────────────
+eod_reports/
+
+# ── Claude Code local state ───────────────────────────────────────────────
+.claude/
+
+# ── OS / editor cruft ─────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
