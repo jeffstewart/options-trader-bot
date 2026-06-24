@@ -10,9 +10,13 @@ Working directory: `/Users/jeff/Claude/Trader`
 
 ## ⚠️ CURRENT LIVE STATE (2026-06-24) — read this first; everything below is from 2026-06-01 and is STALE
 
-**Running:** `bot.py` as a daemon (ppid 1) via `spawn_daemon.py` → pid in `bot.pid` (50808 at last deploy); logs to `bot.log`. Dashboard separate (`dashboard.pid`, port 5001). Restart either with:
-`.venv/bin/python spawn_daemon.py bot.pid bot.log .venv/bin/python -u bot.py`
-Process name is `Python -u bot.py` (capital P on macOS) → `pgrep -f 'Python -u bot.py'`. Log timestamps are LOCAL PDT, not UTC.
+**🗂 RESTRUCTURED 2026-06-24 — the project is now a git repo with an organized layout (was flat):**
+- `core/` runtime+engine (bot.py, config.py, dashboard.py, backtest.py, pricing.py, yahoo_data.py, router_eval.py, spawn_daemon.py) · `research/` ~112 backtest/analysis scripts · `tests/` pytest suite · `docs/` (this file) · `data/` caches+CSVs+`bot_state.json` (gitignored) · `logs/` (gitignored).
+- **Imports** work via `_trader_paths.pth` in the venv site-packages (puts `core/`+`research/` on sys.path) — so flat `import bot`/`import config` still work from anywhere. **Daemons run with CWD=`data/`** (set by `spawn_daemon.py` WORKDIR) so bare data-file refs resolve into `data/`. `config.DATA_DIR`/`LOG_DIR` are the explicit anchors.
+- **Manage daemons with `./manage.sh {start|sched|stop|restart-bot|status|test}`** (wraps the now-verbose absolute-path launch commands). pids in `data/*.pid`, logs in `logs/`.
+- **git:** `main` branch; code+docs tracked, `.env`/data/logs/caches gitignored. Commit going forward.
+
+**Running:** bot, dashboard, `resume_after_reset.py` (backtest scheduler), and the backtest are daemons (ppid 1) via `core/spawn_daemon.py`. Restart the bot: `./manage.sh restart-bot`. Process match is still `pgrep -f 'core/bot.py'` (or `bot.py`). Log timestamps are LOCAL PDT, not UTC. Run tests: `./manage.sh test` (or `.venv/bin/python -m pytest`).
 
 **Scoring flow:** Ollama (`llama3.2`, local, unified_v1 prompt = `SYSTEM_PROMPT`) scores every article. Bullish + passes signal_checks → **(1) pre-score noise + soft-catalyst filters** (drop analyst/PT, technical, acquirer-M&A, AND index-inclusion/reconstitution headlines PRE-score) → **(2) regime gate** (SPY≥200d SMA AND ≥3d-ago momentum) — long-beta paused in downtrend, EXCEPT high-conviction bypass below → **(3) confirm/veto gate** → legs. Index-inclusion filter added 2026-06-24 (`PRESCORE_SKIP_PATTERNS`): backtested on past rebalance windows via Alpaca historical news (`index_event_backtest.py`) — added stocks show NO directional edge (3-day fwd avg +0.1%, ~50% positive) yet over-score to 0.85 → tripped the regime bypass (GOOG/DJIA −36% live). Russell/S&P/Dow reconstitution is a quarterly burst the bot's own caches miss.
 
