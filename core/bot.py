@@ -1981,6 +1981,29 @@ def _run_shadow_monitor():
             continue
     _write_shadow_state()
 
+
+def _log_position_path(symbol: str, pos: dict, mid: float, pnl_pct: float, stop_price) -> None:
+    """Append one monitor-cycle sample of a live position's premium/price path to position_paths.csv.
+    The monitor already fetches the REAL option mid (or stock price) every ~30s for each open position
+    — this just persists it. Gives real intraday premium paths to replay exit rules (take-profit vs
+    trail) on ACTUAL quotes instead of Black-Scholes-synthesized DAILY bars, which is where the
+    breakeven-lock vs trail distinction washed out (trail_winrate_sweep.py). Market-hours only."""
+    try:
+        new = not os.path.exists("position_paths.csv")
+        with open("position_paths.csv", "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["ts", "symbol", "strategy", "asset_type", "underlying",
+                            "entry", "mid", "peak", "pnl_pct", "stop"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), symbol, pos.get("strategy", ""),
+                        pos.get("asset_type", ""), pos.get("underlying", ""),
+                        pos.get("entry_price", ""), round(mid, 4),
+                        pos.get("peak_price") or pos.get("trough_price") or pos.get("entry_price", ""),
+                        round(pnl_pct, 2), stop_price if stop_price is not None else ""])
+    except Exception as e:
+        log.debug("position-path log failed for %s: %s", symbol, e)
+
+
 async def trailing_stop_monitor():
     global _daily_loss_usd   # declared once at function top to satisfy Python scoping
     log.info("📊 Trailing stop monitor started (interval: %ds, trail: %.0f%%)",
@@ -2008,6 +2031,7 @@ async def trailing_stop_monitor():
 
         # Compute the EOD window ONCE per cycle (one clock call, not one per position).
         near_close = near_market_close()
+        mkt_open   = market_is_open()        # cached once/cycle — gates the intraday path log below
 
         for symbol, pos in list(_monitored_positions.items()):
             asset_type = pos.get("asset_type", "option")
@@ -2083,6 +2107,8 @@ async def trailing_stop_monitor():
                     symbol, entry, mid, trough, stop_price, pnl_pct, pnl_usd, strategy,
                 )
                 _write_bot_state()
+                if mkt_open:
+                    _log_position_path(symbol, pos, mid, pnl_pct, stop_price)
                 if mid >= stop_price:
                     log.info("🔴 SHORT STOP triggered: %s  mid=$%.4f ≥ stop=$%.4f  P&L: %+.1f%%",
                              symbol, mid, stop_price, pnl_pct)
@@ -2136,6 +2162,8 @@ async def trailing_stop_monitor():
                 symbol, entry, mid, peak, stop_price, pnl_pct, pnl_usd, strategy,
             )
             _write_bot_state()
+            if mkt_open:
+                _log_position_path(symbol, pos, mid, pnl_pct, stop_price)
 
             # ── LOTTO hard profit cap (Tier-1-validated; asymmetric-safe — only exits a WINNER
             #    early at +200%, never adds a loss). Take full profit the first time premium ≥
