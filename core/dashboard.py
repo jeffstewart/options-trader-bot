@@ -412,9 +412,13 @@ def _close_reason_label(reason: str) -> str:
     return r or "—"
 
 
-def get_recent_trades(n: int = 30) -> list[dict]:
+def get_recent_trades(n: int = 30, open_positions: list[dict] | None = None) -> list[dict]:
     """Unified, time-sorted feed of position OPENS (trades.csv) and CLOSES (closed_trades.csv).
-    Each row carries kind ∈ {open, close}; closes include realized P&L + the close mechanism."""
+    Each row carries kind ∈ {open, close}; closes include realized P&L + the close mechanism.
+    OPEN events are flagged `still_open` against the broker's live holdings (open_positions) so an
+    already-closed open isn't shown with a live "OPEN" badge — which made it look like a current
+    position the (broker-sourced) positions pane didn't list. Broker truth also covers options that
+    expired without a logged close and the stock/pairs rows where option_symbol is "-"."""
     events: list[dict] = []
 
     def _read(path, kind):
@@ -434,6 +438,36 @@ def get_recent_trades(n: int = 30) -> list[dict]:
 
     _read(TRADES_CSV, "open")
     _read(CLOSED_TRADES_CSV, "close")
+
+    # Flag each OPEN as still-live using the broker's current holdings (authoritative). Options key on
+    # the OCC symbol; stock/pairs (option_symbol "-") key on (ticker, strategy). A re-opened instrument
+    # only marks its NEWEST open live — older opens of the same key are closed. If holdings are missing
+    # (broker error), nothing is marked live: a conservative, non-misleading fallback.
+    held_opt: set[str] = set()
+    held_stock: set[tuple] = set()
+    for p in (open_positions or []):
+        if not isinstance(p, dict) or "error" in p:
+            continue
+        if p.get("asset_type") in ("stock", "stock_short"):
+            held_stock.add((p.get("symbol"), p.get("strategy")))
+        else:
+            held_opt.add(p.get("symbol"))
+
+    def _live_key(e):
+        occ = e.get("option_symbol") or ""
+        if occ and occ != "-":
+            return ("opt", occ) if occ in held_opt else None
+        tk = e.get("source_ticker") or e.get("symbol") or ""
+        return ("stk", tk, e.get("strategy")) if (tk, e.get("strategy")) in held_stock else None
+
+    seen_live: set = set()
+    for e in sorted((e for e in events if e["kind"] == "open"),
+                    key=lambda e: e.get("timestamp", ""), reverse=True):
+        k = _live_key(e)
+        e["still_open"] = bool(k and k not in seen_live)
+        if e["still_open"]:
+            seen_live.add(k)
+
     events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return events[:n]
 
@@ -702,7 +736,7 @@ def api_chart():
 def api_status():
     account   = get_account()
     positions = get_positions()
-    trades    = get_recent_trades(30)
+    trades    = get_recent_trades(30, positions)
     stats     = get_stats()
     log_data  = parse_bot_log()
     benchmark = get_benchmark(account)
@@ -1224,7 +1258,11 @@ function renderTrades(trades) {
     } else {
       const cost = t.cost_basis ? fmt(parseFloat(t.cost_basis)) : (t.price ? fmt(parseFloat(t.price)) : "—");
       const conf = t.confidence ? (parseFloat(t.confidence)*100).toFixed(0)+"%" : "";
-      event  = '<span style="font-weight:700;font-size:10px;letter-spacing:.5px;color:#7db3ff;background:#1e3a5f;padding:2px 6px;border-radius:4px">OPEN</span>';
+      // still_open===false → opened then later closed (a CLOSED row carries the P&L); badge it muted so
+      // it isn't mistaken for a live position. Only a genuinely-open entry gets the blue "OPEN".
+      event  = (t.still_open === false)
+        ? '<span style="font-weight:700;font-size:10px;letter-spacing:.5px;color:var(--muted);background:#374151;padding:2px 6px;border-radius:4px">OPENED</span>'
+        : '<span style="font-weight:700;font-size:10px;letter-spacing:.5px;color:#7db3ff;background:#1e3a5f;padding:2px 6px;border-radius:4px">OPEN</span>';
       result = `${cost}${conf?` <span style="font-size:11px;color:var(--muted)">${conf}</span>`:""}`;
       detail = `<div class="reasoning">${esc(t.reasoning||"")}</div>`;
     }
