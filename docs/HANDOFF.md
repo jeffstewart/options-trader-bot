@@ -51,6 +51,42 @@ Working directory: `/Users/jeff/Claude/Trader`
 
 Note: `~/.claude/projects/-Users-jeff-Claude-Trader/memory/project_trader_bot.md` is 276KB — a `/consolidate-memory` pass is overdue. Focused memories now exist for the gate, regime bypass, local rule-out, and Groq A/B.
 
+### 🚀 GO-LIVE / DEPLOYMENT PLAN (decided 2026-06-25 — for when this moves to real money + cloud)
+
+**Move stops BROKER-SIDE on real money — this is the key resilience change.** Alpaca supports
+exchange-held stop / trailing-stop orders on REAL accounts (not paper — which is why the live bot
+currently relies on the in-process trailing-stop monitor, the *sole* protection today → a downed bot
+= unprotected positions). On the real account, place the stop at the broker when opening a position
+so the exchange enforces it even if the bot is down.
+- **VERIFY FIRST (the open question):** does this apply to the OPTION legs (long calls)? The original
+  blocker was *options* eligibility ("not eligible to trade uncovered option contracts"), a separate
+  axis from paper-vs-real. Confirm `stop`/`trailing_stop` order support on options at the account's
+  options approval tier. The EQUITY/pairs legs almost certainly support broker stops regardless.
+- **Why it matters:** broker-side stops convert uptime from **safety-critical → opportunity-only**.
+  Downed bot then = *missed new trades* (opportunity cost), NOT unprotected positions. Broker stops
+  become the resilience layer.
+
+**Deployment architecture (given the above):** keep it SIMPLE — the bot is a stateful **singleton**
+(two instances would double-trade the same account), so:
+- **NO Kubernetes/minikube** (orchestration/replicas buy nothing for a singleton) and **NO serverless**
+  (it's a long-running process holding WebSocket streams + a position monitor).
+- Target a **single always-on container on a managed platform (Fly.io is the standout fit — singleton
+  machines + volumes + auto-restart + health) OR a small VM + `systemd Restart=always`.** Container
+  value here = reproducibility + managed auto-restart/health, not scaling.
+- **State is light:** positions reconstruct from Alpaca on startup; only the trailing-stop high-water
+  marks (`bot_state.json`) must persist → a small volume or a few Redis keys. (Config is already
+  container-ready: `TRADER_DATA_DIR`/`TRADER_LOG_DIR` env overrides, pinned `requirements.txt`,
+  no host paths in `core/`. Add a SIGTERM handler for clean restarts when you write the Dockerfile.)
+- **Instance sizing waits on the Ollama-vs-cloud-Groq-primary decision** (tiny box if cloud-primary;
+  bigger/GPU box or an Ollama sidecar if local scoring stays). The A/B + `groq_vs_ollama_backtest.py`
+  are deciding this.
+
+**Caveats when flipping stops broker-side:** (1) broker stops don't cover the bot's *non-stop* exits
+(max-hold time exit, lotto take-profit cap) — those still need the bot, but they're optimization, not
+protection. (2) Alpaca's native `trailing_stop` is a FIXED trail %/$ — dumber than the in-process
+tiered/profit-scaled logic; **backtest "fixed broker trail vs. current tiered" before flipping** so
+you know the behavior you're trading away for resilience.
+
 ---
 
 ## What this project is
