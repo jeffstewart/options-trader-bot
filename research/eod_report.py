@@ -81,6 +81,47 @@ def shadow_stock_section():
         print(f"  [shadow compare error: {e}]")
 
 
+GATE_WAIT_TIMEOUT_MS = 12000   # matches process_signal's asyncio.wait_for(_gemini_gate, timeout=12)
+
+
+def gate_section():
+    """Confirm/veto gate reliability today. KEY: a row whose gemini_ms exceeds the bot's 12s wait_for
+    was an ACTED-ON fallback even if the gate later returned 'confirm' (the bot gave up at 12s) — the
+    decision column alone undercounts these. Fallbacks now matter more: in an UPTREND the bot trades on
+    Ollama alone, but a DOWNTREND high-conviction bypass with no confirm is SKIPPED (2026-06-25 change)."""
+    hdr("CONFIRM/VETO GATE (today)")
+    try:
+        rows = [r for r in csv.DictReader(open("gemini_decisions.csv")) if r["timestamp"][:10] == TODAY]
+    except FileNotFoundError:
+        print("  (no gemini_decisions.csv)"); return
+    if not rows:
+        print("  no gate calls today (no real-leg-eligible bullish signals)"); return
+    confirms = vetoes = timeouts = other_fb = 0
+    lats = []
+    for r in rows:
+        gms = float(r.get("gemini_ms") or 0)
+        dec = r.get("decision", "")
+        if gms > 0:
+            lats.append(gms)
+        if gms > GATE_WAIT_TIMEOUT_MS:          # bot's wait_for gave up → fallback, regardless of verdict
+            timeouts += 1
+        elif dec == "fallback":                 # cap / rate-limit / error → no usable verdict
+            other_fb += 1
+        elif dec == "confirm":
+            confirms += 1
+        elif dec == "veto":
+            vetoes += 1
+    n = len(rows); fb = timeouts + other_fb
+    print(f"  {n} gate calls   {confirms} confirm / {vetoes} veto / {fb} fallback ({fb / n * 100:.0f}% fallback)")
+    if fb:
+        print(f"     └ fallbacks: {timeouts} timeout(>{GATE_WAIT_TIMEOUT_MS // 1000}s) · {other_fb} cap/ratelimit/error")
+    if lats:
+        lats.sort()
+        p50 = lats[len(lats) // 2]; p90 = lats[min(len(lats) - 1, int(len(lats) * 0.9))]
+        print(f"     latency: median {p50 / 1000:.1f}s · p90 {p90 / 1000:.1f}s · max {max(lats) / 1000:.1f}s  "
+              f"(wait_for {GATE_WAIT_TIMEOUT_MS // 1000}s — fallbacks climb as p90 nears it)")
+
+
 def cap_section():
     hdr("CAP / POSITIONS")
     pos = tc.get_all_positions()
@@ -89,7 +130,7 @@ def cap_section():
 
 def main():
     print(f"════════════ EOD REPORT — {TODAY} ════════════")
-    for fn in (account_section, trades_today, closes_today, shadow_stock_section, cap_section):
+    for fn in (account_section, trades_today, closes_today, gate_section, shadow_stock_section, cap_section):
         try:
             fn()
         except Exception as e:
