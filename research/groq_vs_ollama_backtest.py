@@ -143,7 +143,7 @@ def main():
         cli = OpenAI(base_url=cvs.PROV["groq"][0], api_key=cvs.PROV["groq"][1])  # own client per thread
         todo = [(c, u, fr) for c, u, fr in univ if f"{disp}:{c['ck']}" not in sc]
         print(f"▶ {disp}: {len(todo)} to score (pace {pace}s, concurrent)", flush=True)
-        consec_rl, done = 0, 0
+        consec_rl, dry_rounds, done = 0, 0, 0
         for c, u, fr in todo:
             res, rl = None, False
             for att in range(5):
@@ -155,14 +155,22 @@ def main():
                         if att < 4:
                             time.sleep(15); continue
                     res = None; break
-            if res is None and rl:                  # rate-limited → leave UNSCORED (retry next resume)
+            if res is None and rl:                  # rate-limited → leave UNSCORED, but PERSIST (don't exit)
                 consec_rl += 1
-                if consec_rl >= 12:                 # 12 in a row = daily cap/throttle wall → stop cleanly
-                    print(f"⏸ {disp}: 12 consecutive rate-limits — daily cap/throttle wall; {done} scored "
-                          f"this run, rest left UNSCORED for next resume", flush=True)
-                    break
+                if consec_rl >= 12:                 # hit the per-minute (TPM) wall → long backoff, KEEP GOING
+                    dry_rounds += 1                 # consecutive backoffs with NO success = daily cap (TPD) gone
+                    if dry_rounds >= 8:             # ~16 min of pure throttle → cap really exhausted → stop
+                        print(f"⏸ {disp}: daily cap exhausted ({done} scored this run) — rest UNSCORED "
+                              f"until next reset", flush=True)
+                        break
+                    with lock:
+                        json.dump(sc, open(CACHE, "w"))      # checkpoint progress before the wait
+                    print(f"  ⏳ {disp}: throttle wall (backoff {dry_rounds}/8, {done} scored) — pausing 120s "
+                          f"for the TPM window to free, then resuming…", flush=True)
+                    time.sleep(120)
+                    consec_rl = 0
                 continue
-            consec_rl = 0
+            consec_rl, dry_rounds = 0, 0            # a SUCCESS resets both → captures quota in bursts all day
             with lock:
                 sc[f"{disp}:{c['ck']}"] = res       # real score, or a genuine (non-rate-limit) parse-fail None
                 done += 1
