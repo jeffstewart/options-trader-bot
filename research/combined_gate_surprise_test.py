@@ -9,7 +9,7 @@ sentiment/magnitude semantics are unchanged, then scores the same 45-article sam
 Usage:  USE_YAHOO_BARS=1 .venv/bin/python -u research/combined_gate_surprise_test.py
         SURPRISE_N=200 USE_YAHOO_BARS=1 .venv/bin/python -u research/combined_gate_surprise_test.py
 
-RESULT (2026-06-26) — SURPRISE SIGNAL REFUTED. The n=45 result (surprise rank-IC +0.36–0.39) was a
+RESULT (2026-06-25) — SURPRISE SIGNAL REFUTED. The n=45 result (surprise rank-IC +0.36–0.39) was a
 small-sample mirage. At N=200 surprise collapses to rank-IC +0.07, 90% CI [-0.04, +0.20] (straddles 0),
 hi-lo edge -0.29%. Breakdown: the original lucky 45 cks held +0.39, the other 155 were -0.01. Magnitude
 in the combined call is likewise weak (+0.12). No edge → NOT deployed; the live gate is unchanged. Keep

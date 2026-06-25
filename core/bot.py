@@ -361,7 +361,15 @@ stock_stream._connect = _stock_connect_safe
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def market_is_open() -> bool:
-    return trading_client.get_clock().is_open
+    """Fails to False on a clock/network error rather than propagating — a transient
+    Alpaca ConnectionReset here once killed the whole trailing_stop_monitor (and the bot).
+    False is the safe default: stop-close branches defer ("market closed, will retry") and
+    re-check next cycle; the position stays protected. See near_market_close (same pattern)."""
+    try:
+        return trading_client.get_clock().is_open
+    except Exception as e:
+        log.warning("market_is_open clock error (%s) — assuming closed this cycle", e)
+        return False
 
 def near_market_close(within_min: int = TIME_STOP_EOD_WINDOW_MIN) -> bool:
     """True if the regular session is open AND within `within_min` of the close.
