@@ -2789,13 +2789,18 @@ async def process_signal(headline: str, body: str, source: str,
     # Regime gate: the long-only beta strategies (news_call / qqq_macro / stock /
     # pead) are leveraged long-beta — only open them in an uptrend (index > 200d
     # SMA). Pairs/bear_short above already ran regardless of regime.
+    regime_bypass = False
     if not market_in_uptrend():
         # High-conviction bypass: strong idiosyncratic catalysts (mag ≥ threshold) clear the regime
         # filter even in a downtrend — backtested to stay profitable on options in down-regimes incl.
-        # the 2022 bear. The llama-4-scout confirm/veto gate downstream still vets them.
+        # the 2022 bear. BUT a downtrend bypass now REQUIRES an explicit CONFIRM from the secondary
+        # (mistral-large) gate: on a gate timeout/cap/error we do NOT fall back to trading on Ollama
+        # alone (enforced just before the trade loop below). 2026-06-25: a gate TimeoutError let a
+        # marginal "Boeing wins $2B contract" call through this path and lost -34% same day.
         if magnitude >= REGIME_BYPASS_MIN_MAGNITUDE:
+            regime_bypass = True
             log.info("  ⚡ downtrend BUT high-conviction (mag=%.2f ≥ %.2f) → bypassing regime filter "
-                     "(confirm/veto gate still applies)", magnitude, REGIME_BYPASS_MIN_MAGNITUDE)
+                     "(gate CONFIRM required — no Ollama-fallback trade)", magnitude, REGIME_BYPASS_MIN_MAGNITUDE)
         else:
             log.info("  → downtrend (regime filter) — skipping long-beta strategies "
                      "(pairs/bear_short still active)")
@@ -2872,6 +2877,15 @@ async def process_signal(headline: str, body: str, source: str,
         else:
             log.info("  ↩️  %s fallback on %s → trading on Ollama [scorer=ollama_fallback]  (ollama %.0fms)",
                      GATE_LABEL, tickers[:2], score_ms)
+
+    # Downtrend bypass safety: only trade into a downtrend when the secondary model EXPLICITLY confirmed
+    # (_scorer == "gemini"). A gate timeout/cap/error (→ ollama_fallback) or a disabled gate (→ ollama)
+    # must NOT trade here — fail CLOSED, unlike the normal uptrend path which keeps trading on Ollama when
+    # the gate is unavailable. (A veto already returned above, so this only catches the no-confirm cases.)
+    if regime_bypass and signal.get("_scorer") != "gemini":
+        log.warning("  ⛔ downtrend bypass NOT confirmed by %s (scorer=%s) → skipping: no trade into a "
+                    "downtrend without the secondary model", GATE_LABEL, signal.get("_scorer"))
+        return
 
     for ticker in tickers[:2]:
         if on_cooldown(ticker):
