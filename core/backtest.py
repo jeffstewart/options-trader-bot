@@ -524,6 +524,16 @@ def simulate_option_pnl(
             tr = next(t for thresh, t in ep["tiers"] if ret < thresh)
             if premium <= peak_value * (1 - tr):
                 hit, reason = True, "tiered_trail"
+        elif exit_rule == "trail_breakeven":
+            # Normal premium trail (TRAILING_STOP_PCT), BUT once the peak gain reaches be_arm the stop
+            # floor is lifted to breakeven+be_lock, so a winner that fades can't round-trip deep into the
+            # red. Trades give-back upside (a faded-then-recovered winner gets cut at ~breakeven) for a
+            # higher win rate — the +15%→-25% case the live 40% flat trail allows.
+            stop = prem_stop
+            if peak_ret >= ep.get("be_arm", 0.15):
+                stop = max(stop, entry_premium * (1.0 + ep.get("be_lock", 0.0)))
+            if premium <= stop:
+                hit, reason = True, "trail_breakeven"
         else:  # unknown rule → baseline
             if premium <= prem_stop:
                 hit, reason = True, "trailing_stop"
@@ -569,6 +579,7 @@ def simulate_option_pnl(
         "exit_value":        round(exit_value, 2),
         "pnl_usd":           round(pnl_usd, 2),
         "pnl_pct":           round(pnl_pct, 2),
+        "peak_ret":          round(peak_value / entry_premium - 1.0, 4),   # best gain reached (for exit-policy analysis)
         "magnitude":         round(magnitude, 3),
         "confidence":        round(confidence, 3),
         "position_usd":      round(position_usd, 2),
