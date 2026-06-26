@@ -55,7 +55,7 @@ from config import (
     GATE_LABEL, GATE_LATCH_ON_RATELIMIT,
     SOFT_CATALYST_GATE_ENABLED, SOFT_CATALYST_PATTERNS,
     MAGNITUDE_SIZING_ENABLED, NONMAG_SIZE_FRAC, MAX_FEED_LAG_SECS,
-    PRESCORE_FILTER_ENABLED, PRESCORE_SKIP_PATTERNS,
+    PRESCORE_FILTER_ENABLED, PRESCORE_SKIP_PATTERNS, PRESCORE_SKIP_REGEXES,
     COOLDOWN_SECS, MIN_MAGNITUDE, BASE_CONFIDENCE, CONFIDENCE_SLOPE,
     STOCK_MIN_CONFIDENCE, STOCK_MIN_MAGNITUDE,
     MAX_POSITION_USD, DAILY_LOSS_LIMIT, MAX_CONTRACT_BUDGET_MULT,
@@ -1372,7 +1372,11 @@ def _prescore_noise(headline: str) -> "str | None":
     """Return the matched PRESCORE_SKIP_PATTERN (macro wrap / listicle / reactive recap) or None.
     Checked on the HEADLINE only, BEFORE scoring — these never warrant an Ollama/Groq call."""
     h = (headline or "").lower()
-    return next((p for p in PRESCORE_SKIP_PATTERNS if p in h), None)
+    sub = next((p for p in PRESCORE_SKIP_PATTERNS if p in h), None)
+    if sub:
+        return sub
+    rx = next((r for r in PRESCORE_SKIP_REGEXES if r.search(headline or "")), None)
+    return rx.pattern if rx else None
 
 def _router_reset_if_new_day():
     today = datetime.now(timezone.utc).date()
@@ -3269,6 +3273,24 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _supervised_monitor():
+    """Keep the trailing-stop monitor alive. It's one of several coroutines in asyncio.gather, so an
+    unhandled exception in a cycle (a transient Alpaca/quote error the cycle didn't catch) would
+    propagate through gather → asyncio.run → KILL THE WHOLE BOT (the 2026-06-25 ConnectionReset crash).
+    This restarts the loop instead; module-global state (_monitored_positions, _postclose) means a
+    restart resumes cleanly. CancelledError still propagates so shutdown works."""
+    while True:
+        try:
+            await trailing_stop_monitor()
+            return                                    # clean exit (the loop is while True → never)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("⚠️ trailing_stop_monitor crashed (%s: %s) — restarting in 5s; positions remain "
+                      "held, monitoring resumes next cycle", type(e).__name__, e)
+            await asyncio.sleep(5)
+
+
 async def main():
     log.info("🚀 News trading bot starting (paper mode · model: %s)", OLLAMA_MODEL)
     log.info("   Magnitude gate       : %.2f",      MIN_MAGNITUDE)
@@ -3316,7 +3338,7 @@ async def main():
     await asyncio.gather(
         stream._run_forever(),
         stock_stream._run_forever(),
-        trailing_stop_monitor(),
+        _supervised_monitor(),
         sec_rss_poller(),
         newsapi_poller(),
     )

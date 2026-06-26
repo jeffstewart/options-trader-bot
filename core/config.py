@@ -8,6 +8,7 @@ Credentials are loaded from .env — never hardcode keys here.
 """
 
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -84,6 +85,21 @@ PRESCORE_SKIP_PATTERNS = (
     "to join the s&p", "joins the s&p", "joins s&p", "added to the s&p",
     "to join the russell", "joins the russell", "added to the russell", "added to russell",
     "to join the nasdaq", "join the nasdaq-100", "join the dow jones", "joins the dow jones",
+)
+
+# Regex skip patterns — for noise that needs more than a fixed substring. Benzinga's algorithmic
+# "returns-calculator" / performance-recap articles ("$100 Invested In X 10 Years Ago Would Be Worth…",
+# "If You Invested $1000 In Y…", "Z Has Outperformed The Market Over The Past 10 Years…") are pure
+# retrospective filler with NO forward catalyst, yet the model over-scores them (264 of 511 hit bullish
+# mag≥0.75 → would trade, e.g. the QCOM pairs entry). They're ~12% of all articles. Anchored on the
+# retrospective phrasing so REAL capex ("$100M invested in a plant") is not caught — validated 2026-06-26:
+# 511/4420 matched, ZERO without a retrospective marker. (gate_threshold_sweep showed the gate's mag bar
+# is fine — the weak-catalyst leak is CONTENT, so filter it pre-score.)
+PRESCORE_SKIP_REGEXES = (
+    re.compile(r"\bif you (?:had )?invested\b", re.I),                     # "If You Invested $1000 In X…"
+    re.compile(r"\$[\d,]+\s+invested\s+in\b", re.I),                        # "$100 Invested In X …" (bare $ → not $100M)
+    re.compile(r"\d+\s+years?\s+ago\s+would\s+be\s+worth", re.I),           # "…10 Years Ago Would Be Worth…"
+    re.compile(r"\boutperformed\b[^.]{0,40}\bover the (?:past|last)\s+\d+\s+(?:year|month)", re.I),
 )
 
 # ── Stale-news drop (2026-06-22) ───────────────────────────────────────────────────────
