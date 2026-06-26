@@ -50,7 +50,7 @@ from config import (
     ALPACA_KEY, ALPACA_SECRET, NEWSAPI_KEY,
     OLLAMA_BASE_URL, OLLAMA_MODEL,
     GROQ_SCORER_SHADOW_ENABLED, GROQ_BASE_URL, GROQ_KEY, GROQ_MODEL, GROQ_AB_MODELS,
-    HYBRID_SCORER_ENABLED, GEMINI_BASE_URL, GEMINI_KEY, GEMINI_MODEL,
+    HYBRID_SCORER_ENABLED, GEMINI_BASE_URL, GEMINI_KEY, GEMINI_MODEL, GATE_WAIT_TIMEOUT_SECS,
     GEMINI_DAILY_CAP, GEMINI_CONFIRM_MIN_MAGNITUDE, GEMINI_VETO_SHADOW_ENABLED,
     GATE_LABEL, GATE_LATCH_ON_RATELIMIT,
     SOFT_CATALYST_GATE_ENABLED, SOFT_CATALYST_PATTERNS,
@@ -2988,7 +2988,7 @@ async def process_signal(headline: str, body: str, source: str,
         try:
             decision, _g, g_ms = await asyncio.wait_for(
                 loop.run_in_executor(None, _gemini_gate, signal, headline, body, source, score_ms),
-                timeout=12)
+                timeout=GATE_WAIT_TIMEOUT_SECS)
         except Exception as e:
             decision, g_ms = "fallback", 0.0
             _gemini_day["fallbacks"] += 1

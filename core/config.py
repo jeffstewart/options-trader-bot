@@ -154,6 +154,12 @@ HYBRID_SCORER_ENABLED        = os.environ.get("HYBRID_SCORER_ENABLED", "1") == "
 GEMINI_BASE_URL              = os.environ.get("CONFIRM_GATE_BASE_URL", os.environ.get("MISTRAL_BASE_URL", ""))
 GEMINI_KEY                   = os.environ.get("CONFIRM_GATE_KEY", os.environ.get("MISTRAL_API_KEY", ""))
 GEMINI_MODEL                 = os.environ.get("CONFIRM_GATE_MODEL", "mistral-large-latest")
+# How long process_signal waits for the gate before falling back/skipping. Bumped 12→20s 2026-06-26:
+# mistral-large free-tier latency is server-side and variable (idle-machine test: median 24s, p90 grew
+# 7.7→10.4s over 2 days), so a 12s cap was timing out the slow tail and — now that the downtrend bypass
+# fails closed — needlessly skipping trades. 20s catches most of the tail; the entry delay is negligible
+# for a multi-day hold. Real fix is moving the gate to a fast Groq production model (pending backtest).
+GATE_WAIT_TIMEOUT_SECS       = int(os.environ.get("GATE_WAIT_TIMEOUT_SECS", "20"))
 GEMINI_DAILY_CAP             = int(os.environ.get("CONFIRM_GATE_DAILY_CAP", "1000"))  # gate volume ~10-30/day — well under any free-tier cap
 GEMINI_CONFIRM_MIN_MAGNITUDE = 0.50   # gate must independently see ≥ this BULLISH magnitude to confirm. Raised
                                       # 0.40→0.50 (2026-06-24) for mistral-large: its mags run higher (median 0.65);

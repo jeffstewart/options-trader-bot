@@ -81,7 +81,7 @@ def shadow_stock_section():
         print(f"  [shadow compare error: {e}]")
 
 
-GATE_WAIT_TIMEOUT_MS = 12000   # matches process_signal's asyncio.wait_for(_gemini_gate, timeout=12)
+GATE_WAIT_TIMEOUT_MS = c.GATE_WAIT_TIMEOUT_SECS * 1000   # auto-synced to the live gate wait_for
 
 
 def gate_section():
