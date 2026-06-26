@@ -52,3 +52,26 @@ def test_max_hold_pairs_has_no_time_cap():
 
 def test_max_hold_unknown_strategy_defaults_to_no_cap():
     assert bot.max_hold_days_for("nonexistent_strategy", "stock") == 0
+
+
+# ── news_call RATCHET trail: tightens by peak-gain (deployed 2026-06-26) ──────────────────
+def test_news_call_ratchet_tightens_with_peak_gain():
+    # fed the PEAK gain by long_trail_for → monotonic ratchet. Default tiers 40/25/15 @ +15/+35%.
+    assert bot.news_call_trail_pct(0.00) == 0.40
+    assert bot.news_call_trail_pct(0.149) == 0.40
+    assert bot.news_call_trail_pct(0.15) == 0.25
+    assert bot.news_call_trail_pct(0.349) == 0.25
+    assert bot.news_call_trail_pct(0.35) == 0.15
+    assert bot.news_call_trail_pct(2.0) == 0.15
+
+
+def test_news_call_ratchet_is_monotonic_non_increasing():
+    gains = [i / 100 for i in range(0, 200, 5)]
+    trails = [bot.news_call_trail_pct(g) for g in gains]
+    assert all(b <= a for a, b in zip(trails, trails[1:])), "ratchet trail must only tighten"
+
+
+def test_long_trail_for_news_call_uses_ratchet():
+    # routes through the ratchet, not the flat NEWS_CALL_TRAIL_PCT, once past the first tier
+    assert bot.long_trail_for("news_call", "option", 0.20) == 0.25
+    assert bot.long_trail_for("news_call", "option", 0.0) == config.NEWS_CALL_TRAIL_PCT  # first tier = flat 40%

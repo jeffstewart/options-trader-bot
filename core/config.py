@@ -405,12 +405,16 @@ TRAILING_STOP_PCT  = 0.10
 #   gain ≥ +300%  → 13% trail   (protect the big winner)
 EXIT_TIERS = [(1.00, 0.30), (3.00, 0.20), (float("inf"), 0.13)]
 
-# news_call uses a FLAT premium trailing stop (NOT the tiered EXIT_TIERS above, which
-# qqq_macro still uses). 2026-06-14 exit_sweep_unified: on the Δ0.40/DTE10 short-dated calls,
-# a wide 40% flat trail + 3-day hold cap (NEWS_CALL_MAX_HOLD_DAYS) beat the tiered/no-cap exit
-# by +$41k / +0.41 Sharpe (CI [$53k,$188k]). Wide trail lets the fast move run; the 3d cap does
-# the cutting. Threaded via long_trail_for() for strategy=="news_call".
-NEWS_CALL_TRAIL_PCT = 0.40
+# news_call exit. Flat 40% (NEWS_CALL_TRAIL_PCT) was the 2026-06-14 daily-sweep choice and is kept as
+# the fallback. RATCHET deployed 2026-06-26 (NEWS_CALL_EXIT_TIERS): a peak-gain tiered trail — 40%
+# until +15%, 25% until +35%, 15% above. exit_intraday_sweep.py (hourly bars, de-biased) showed it
+# beats flat-40% on win rate (37% vs 30%), P&L and the +15%→red round-trip: start wide so early noise
+# doesn't stop you out (preserves win rate), tighten after a gain so faded winners exit green. Applied
+# via long_trail_for(), which receives the PEAK gain → monotonic ratchet (stop only ever rises).
+# RE-EVALUATE on the real position_paths.csv 30s quotes (incl. post-close) once accumulated. Set
+# NEWS_CALL_EXIT_TIERS = [] to revert to the flat NEWS_CALL_TRAIL_PCT.
+NEWS_CALL_TRAIL_PCT  = 0.40
+NEWS_CALL_EXIT_TIERS = [(0.15, 0.40), (0.35, 0.25), (float("inf"), 0.15)]
 
 # How often the monitor loop checks open positions (seconds).
 MONITOR_INTERVAL   = 30

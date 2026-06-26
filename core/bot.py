@@ -77,7 +77,7 @@ from config import (
     STOCK_ENABLED, STOCK_SHADOW_ENABLED,
     MAX_OPEN_POSITIONS, NEWS_CALL_ENABLED, NEWS_CALL_MIN_MAGNITUDE, NEWS_CALL_SHADOW_ENABLED,
     NEWS_CALL_DTE_MIN, NEWS_CALL_DTE_MAX, NEWS_CALL_TARGET_DELTA,
-    NEWS_CALL_MAX_HOLD_DAYS, NEWS_CALL_TRAIL_PCT,
+    NEWS_CALL_MAX_HOLD_DAYS, NEWS_CALL_TRAIL_PCT, NEWS_CALL_EXIT_TIERS,
     NEWS_CALL_BUDGET_MULT, NEWS_CALL_MAX_PER_TICKER_DAY,
     NEWS_STOCK_MAX_HOLD_DAYS, PEAD_MAX_HOLD_DAYS, LOTTO_MAX_HOLD_DAYS,
     TIME_STOP_EOD_WINDOW_MIN,
@@ -156,6 +156,19 @@ def tiered_trail_pct(gain: float) -> float:
             return trail
     return EXIT_TIERS[-1][1]
 
+
+def news_call_trail_pct(gain: float) -> float:
+    """RATCHET trail for news_call (deployed 2026-06-26): tightens as the PEAK gain grows —
+    NEWS_CALL_EXIT_TIERS = 40% until +15%, 25% until +35%, 15% above. Since long_trail_for is fed the
+    peak gain, this only ever tightens (true ratchet). Falls back to flat NEWS_CALL_TRAIL_PCT if the
+    tiers are emptied (the revert switch). See exit_intraday_sweep.py for the evidence."""
+    if not NEWS_CALL_EXIT_TIERS:
+        return NEWS_CALL_TRAIL_PCT
+    for thresh, trail in NEWS_CALL_EXIT_TIERS:
+        if gain < thresh:
+            return trail
+    return NEWS_CALL_EXIT_TIERS[-1][1]
+
 def pead_trail_pct(gain: float) -> float:
     """Tiered trailing stop for PEAD stock positions. Tightens as gain grows."""
     for thresh, trail in PEAD_EXIT_TIERS:
@@ -179,7 +192,7 @@ def long_trail_for(strategy: str, asset_type: str, gain: float) -> float:
     if strategy == "lotto":
         return lotto_trail_pct(gain)
     if strategy == "news_call":
-        return NEWS_CALL_TRAIL_PCT          # flat wide trail (exit sweep); 3d cap does the cutting
+        return news_call_trail_pct(gain)    # RATCHET (2026-06-26): 40/25/15 by peak-gain @ +15/+35%
     if strategy == "pairs_long":
         return PAIRS_LONG_TRAIL
     if asset_type == "stock":
@@ -1982,32 +1995,106 @@ def _run_shadow_monitor():
     _write_shadow_state()
 
 
-def _log_position_path(symbol: str, pos: dict, mid: float, pnl_pct: float, stop_price) -> None:
-    """Append one monitor-cycle sample of a live position's premium/price path to position_paths.csv.
-    The monitor already fetches the REAL option mid (or stock price) every ~30s for each open position
-    — this just persists it. Gives real intraday premium paths to replay exit rules (take-profit vs
-    trail) on ACTUAL quotes instead of Black-Scholes-synthesized DAILY bars, which is where the
-    breakeven-lock vs trail distinction washed out (trail_winrate_sweep.py). Market-hours only."""
+def _log_position_path(symbol: str, pos: dict, mid: float, pnl_pct: float, stop_price, phase: str = "open") -> None:
+    """Append one monitor-cycle sample of a position's premium/price path to position_paths.csv.
+    The monitor already fetches the REAL option mid (or stock price) every ~30s — this persists it.
+    phase='open' = while we hold it; phase='postclose' = AFTER we exited, kept until the position's
+    natural horizon so we can replay alternate exit rules on the FULL real path (would a different exit
+    have done better, incl. holding past our exit?). Real quotes beat the BS-synthesized daily bars where
+    the trail/ratchet distinctions washed out (trail_winrate_sweep / exit_intraday_sweep). Market-hours only."""
     try:
         new = not os.path.exists("position_paths.csv")
         with open("position_paths.csv", "a", newline="") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(["ts", "symbol", "strategy", "asset_type", "underlying",
-                            "entry", "mid", "peak", "pnl_pct", "stop"])
+                            "entry", "mid", "peak", "pnl_pct", "stop", "phase"])
             w.writerow([datetime.now(timezone.utc).isoformat(), symbol, pos.get("strategy", ""),
                         pos.get("asset_type", ""), pos.get("underlying", ""),
                         pos.get("entry_price", ""), round(mid, 4),
                         pos.get("peak_price") or pos.get("trough_price") or pos.get("entry_price", ""),
-                        round(pnl_pct, 2), stop_price if stop_price is not None else ""])
+                        round(pnl_pct, 2), stop_price if stop_price is not None else "", phase])
     except Exception as e:
         log.debug("position-path log failed for %s: %s", symbol, e)
+
+
+# ── Post-close path capture: keep sampling a CLOSED position's real ~30s quote until its natural
+#    horizon, so we can replay alternate exit rules on the full path (request 2026-06-26). ──
+_postclose: dict[str, dict] = {}
+_POSTCLOSE_FILE = "postclose_tracking.json"
+
+
+def _write_postclose() -> None:
+    try:
+        json.dump(_postclose, open(_POSTCLOSE_FILE, "w"))
+    except Exception as e:
+        log.debug("postclose write failed: %s", e)
+
+
+def _load_postclose() -> None:
+    global _postclose
+    try:
+        if os.path.exists(_POSTCLOSE_FILE):
+            _postclose = json.load(open(_POSTCLOSE_FILE))
+    except Exception:
+        _postclose = {}
+
+
+def _register_postclose(symbol: str, pos: dict, exit_price) -> None:
+    """On close, start tracking the position's would-be path until ~its natural max-hold horizon."""
+    try:
+        edt = pos.get("entry_dt")
+        base = edt if isinstance(edt, datetime) else datetime.now(timezone.utc)
+        strat = pos.get("strategy", ""); at = pos.get("asset_type", "option")
+        mh = max_hold_days_for(strat, at) or 3
+        _postclose[symbol] = {
+            "entry_price": pos.get("entry_price"), "entry_dt": base.isoformat(),
+            "exit_dt": datetime.now(timezone.utc).isoformat(), "exit_price": exit_price,
+            "strategy": strat, "asset_type": at,
+            "underlying": pos.get("underlying", symbol.split("__")[0]), "qty": pos.get("qty"),
+            "peak_price": pos.get("peak_price") or pos.get("entry_price"),
+            "horizon_dt": (base + timedelta(days=max(2, int(mh * 1.5) + 2))).isoformat(),
+        }
+        _write_postclose()
+    except Exception as e:
+        log.debug("postclose register failed for %s: %s", symbol, e)
+
+
+def _sample_postclose() -> None:
+    """One market-hours sample of each tracked closed position; drop those past their horizon."""
+    if not _postclose:
+        return
+    now = datetime.now(timezone.utc)
+    changed = False
+    for sym in list(_postclose):
+        pc = _postclose[sym]
+        try:
+            if now >= datetime.fromisoformat(pc["horizon_dt"]):
+                del _postclose[sym]; changed = True; continue
+        except Exception:
+            del _postclose[sym]; changed = True; continue
+        if sym in _monitored_positions:          # re-opened → live monitor logs it; skip post-close
+            continue
+        if pc.get("asset_type") in ("stock", "stock_short"):
+            mid = _price_cache.get(pc.get("underlying")) or get_stock_price(pc.get("underlying"), subscribe=False)
+        else:
+            q = get_option_quote(sym); mid = q["mid"] if q else None
+        if mid is None:
+            continue
+        if mid > (pc.get("peak_price") or 0):    # track post-exit peak (did it run higher than we got?)
+            pc["peak_price"] = mid; changed = True
+        entry = pc.get("entry_price") or 0
+        pnl_pct = ((mid - entry) / entry * 100) if entry else 0
+        _log_position_path(sym, pc, mid, pnl_pct, "", phase="postclose")
+    if changed:
+        _write_postclose()
 
 
 async def trailing_stop_monitor():
     global _daily_loss_usd   # declared once at function top to satisfy Python scoping
     log.info("📊 Trailing stop monitor started (interval: %ds, trail: %.0f%%)",
              MONITOR_INTERVAL, TRAILING_STOP_PCT * 100)
+    _load_postclose()
     while True:
         await asyncio.sleep(MONITOR_INTERVAL)
 
@@ -2021,6 +2108,15 @@ async def trailing_stop_monitor():
         except Exception as e:
             log.debug("shadow monitor error: %s", e)
 
+        # Post-close path capture runs even when no positions are open (a closed position keeps
+        # getting sampled until its horizon). One clock call/cycle, reused below.
+        mkt_open = market_is_open()
+        if mkt_open:
+            try:
+                _sample_postclose()
+            except Exception as e:
+                log.debug("postclose sample error: %s", e)
+
         if not _monitored_positions:
             continue
 
@@ -2031,7 +2127,6 @@ async def trailing_stop_monitor():
 
         # Compute the EOD window ONCE per cycle (one clock call, not one per position).
         near_close = near_market_close()
-        mkt_open   = market_is_open()        # cached once/cycle — gates the intraday path log below
 
         for symbol, pos in list(_monitored_positions.items()):
             asset_type = pos.get("asset_type", "option")
@@ -2084,6 +2179,7 @@ async def trailing_stop_monitor():
                     log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="time-stop")
                     if pnl_usd < 0:
                         _daily_loss_usd += abs(pnl_usd)
+                    _register_postclose(symbol, pos, exit_px)
                     del _monitored_positions[symbol]
                 else:
                     log.warning("⏳ Time-stop close not confirmed for %s — will retry", symbol)
@@ -2124,6 +2220,7 @@ async def trailing_stop_monitor():
                     log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="stop")
                     if pnl_usd < 0:
                         _daily_loss_usd += abs(pnl_usd)
+                    _register_postclose(symbol, pos, exit_px)
                     del _monitored_positions[symbol]
                 continue   # short handled — skip the long logic below
 
@@ -2185,6 +2282,7 @@ async def trailing_stop_monitor():
                 log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="lotto_cap")
                 if pnl_usd < 0:                       # defensive — a +200% cap is ~never a loss
                     _daily_loss_usd += abs(pnl_usd)
+                _register_postclose(symbol, pos, exit_px)
                 del _monitored_positions[symbol]
                 continue
 
@@ -2216,6 +2314,7 @@ async def trailing_stop_monitor():
                     log.info("   Daily loss running total: $%.0f / $%.0f limit",
                              _daily_loss_usd, DAILY_LOSS_LIMIT)
 
+                _register_postclose(symbol, pos, exit_px)
                 del _monitored_positions[symbol]
 
 # ═══════════════════════════════════════════════════════════════════════════════
