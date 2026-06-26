@@ -36,7 +36,7 @@ SCORES_PATH = "prompt_exp_scores.json"
 # llama-3.1-8b-instant (dep. 2026-06-25) + llama-4-scout (dep. 2026-06-24) removed; gpt-oss-20b is the
 # cheap-tier replacement Groq recommends.
 _DEFAULT_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b",
-                   "openai/gpt-oss-120b", "qwen/qwen3-32b"]
+                   "openai/gpt-oss-120b", "qwen/qwen3.6-27b"]   # qwen3-32b → qwen3.6-27b (Groq dep.)
 MODELS = [m.strip() for m in os.environ.get("GS_MODELS", ",".join(_DEFAULT_MODELS)).split(",") if m.strip()]
 INCLUDE_OLLAMA = os.environ.get("GS_OLLAMA", "1") == "1"
 OLLAMA = OpenAI(base_url=cfg.OLLAMA_BASE_URL, api_key="ollama")

@@ -5,13 +5,14 @@
 # daily quota is exhausted by then it will error into its own log, leaving qwen intact.
 cd /Users/jeff/Claude/Trader
 
-echo "$(date '+%Y-%m-%d %H:%M') starting qwen3-32b / materiality_fewshot (TEST split)"
+# qwen3-32b deprecated by Groq (2026) → use qwen3.6-27b (the current qwen) if this is re-run.
+echo "$(date '+%Y-%m-%d %H:%M') starting qwen3.6-27b / materiality_fewshot (TEST split)"
 USE_YAHOO_BARS=1 .venv/bin/python prompt_exp.py \
-    --provider groq --model qwen/qwen3-32b \
+    --provider groq --model qwen/qwen3.6-27b \
     --prompts materiality_fewshot \
     --split test --limit 1000 --delay 2 \
-    > prompt_exp_groq_qwen32b_test.log 2>&1
-echo "$(date '+%Y-%m-%d %H:%M') qwen3-32b TEST done (exit $?)"
+    > prompt_exp_groq_qwen36_test.log 2>&1
+echo "$(date '+%Y-%m-%d %H:%M') qwen3.6-27b TEST done (exit $?)"
 
 echo "$(date '+%Y-%m-%d %H:%M') starting gpt-oss-20b / materiality_fewshot (TEST split)"
 USE_YAHOO_BARS=1 .venv/bin/python prompt_exp.py \
