@@ -62,7 +62,7 @@ from config import (
     PRICE_CROSSCHECK_ENABLED, PRICE_CROSSCHECK_TOL,
     MIN_DAYS_TO_EXPIRY, MAX_DAYS_TO_EXPIRY, TARGET_DELTA,
     QQQ_MACRO_DTE_MIN, QQQ_MACRO_DTE_MAX, QQQ_MACRO_TARGET_DELTA, QQQ_MACRO_ENABLED,
-    MIN_MARKET_CAP_B, MAX_SPREAD_PCT, MIN_OPEN_INTEREST, MIN_STOCK_PRICE,
+    MIN_MARKET_CAP_B, MAX_SPREAD_PCT, MAX_MONITOR_SPREAD_PCT, MIN_OPEN_INTEREST, MIN_STOCK_PRICE,
     TRAILING_STOP_PCT, EXIT_TIERS, MONITOR_INTERVAL,
     PEAD_EXIT_TIERS, PEAD_BREAKEVEN_LOCK, BEAR_SHORT_TRAIL_PCT, BEAR_SHORT_ENABLED,
     PEAD_MAX_POSITIONS, PEAD_SHADOW_ENABLED,
@@ -2083,6 +2083,8 @@ def _sample_postclose() -> None:
             mid = _price_cache.get(pc.get("underlying")) or get_stock_price(pc.get("underlying"), subscribe=False)
         else:
             q = get_option_quote(sym); mid = q["mid"] if q else None
+            if q and q.get("spread_pct", 0) > MAX_MONITOR_SPREAD_PCT:
+                mid = None           # same blown-spread guard → keep garbage out of the post-close path data
         if mid is None:
             continue
         if mid > (pc.get("peak_price") or 0):    # track post-exit peak (did it run higher than we got?)
@@ -2143,6 +2145,10 @@ async def trailing_stop_monitor():
             else:
                 q   = get_option_quote(symbol)
                 mid = q["mid"] if q else None
+                if q and q.get("spread_pct", 0) > MAX_MONITOR_SPREAD_PCT:
+                    log.debug("  ⚠ %s bad quote (spread %.0f%%, mid $%.2f) — skipping cycle (protects peak/stop)",
+                              symbol, q["spread_pct"] * 100, mid)
+                    mid = None      # blown-spread garbage → treat as no-quote (skip below)
 
             if mid is None:
                 log.debug("  👁 %s — no price available", symbol)

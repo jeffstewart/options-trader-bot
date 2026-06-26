@@ -402,6 +402,13 @@ MIN_MARKET_CAP_B   = 2.0
 # Prevents entering a position that is immediately deep underwater.
 MAX_SPREAD_PCT     = 0.20   # 20%
 
+# Monitoring quote sanity: in the trailing-stop monitor (and post-close capture), reject an option
+# quote whose bid/ask spread exceeds this — a crossed/garbage two-sided quote yields a bad mid that
+# corrupts the peak (→ ratchet stop fires falsely) and the position_paths data. 2026-06-26: a $1.96
+# print on a ~$0.56 BA call (spread ~195%) set a false +250% peak and force-closed the trade. Well
+# above the 20% entry cap and normal intraday widening, so only garbage is dropped.
+MAX_MONITOR_SPREAD_PCT = float(os.environ.get("MAX_MONITOR_SPREAD_PCT", "0.60"))   # 60%
+
 # Skip contracts with fewer than this many open contracts -- proxy for liquidity.
 MIN_OPEN_INTEREST  = 100
 
