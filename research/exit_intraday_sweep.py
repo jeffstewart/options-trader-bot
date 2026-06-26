@@ -27,13 +27,22 @@ GATE = lambda m, c: m >= cfg.NEWS_CALL_MIN_MAGNITUDE and es.dyn_gate(m, c)
 CACHE = "intraday_bars_cache.json"
 _cache = json.load(open(CACHE)) if os.path.exists(CACHE) else {}
 
+INF = float("inf")
+# ratchet tiers = [(peak-gain threshold, trail% while below it)], applied off the PEAK gain so the trail
+# only ever TIGHTENS (true ratchet). Live EXIT_TIERS thresholds (+100/+300%) almost never engage on a
+# 3-day option, so also test ratchets tuned to where news_call lives (+15–50%).
 POLICIES = [
-    {"name": "flat 40% (LIVE)",       "rule": "trail_premium",  "trail": 0.40, "target": None},
-    {"name": "flat 25%",              "rule": "trail_premium",  "trail": 0.25, "target": None},
-    {"name": "40% + BE-lock @+15%",   "rule": "trail_breakeven", "trail": 0.40, "be_arm": 0.15, "be_lock": 0.0, "target": None},
-    {"name": "40% + BE-lock @+20%",   "rule": "trail_breakeven", "trail": 0.40, "be_arm": 0.20, "be_lock": 0.0, "target": None},
-    {"name": "take-profit @+25%",     "rule": "trail_premium",  "trail": 0.40, "target": 0.25},
-    {"name": "take-profit @+40%",     "rule": "trail_premium",  "trail": 0.40, "target": 0.40},
+    {"name": "flat 40% (LIVE)",       "rule": "trail_premium", "trail": 0.40, "target": None},
+    {"name": "flat 30%",              "rule": "trail_premium", "trail": 0.30, "target": None},
+    {"name": "flat 25%",              "rule": "trail_premium", "trail": 0.25, "target": None},
+    {"name": "flat 20%",              "rule": "trail_premium", "trail": 0.20, "target": None},
+    {"name": "flat 15%",              "rule": "trail_premium", "trail": 0.15, "target": None},
+    {"name": "flat 12%",              "rule": "trail_premium", "trail": 0.12, "target": None},
+    {"name": "flat 10%",              "rule": "trail_premium", "trail": 0.10, "target": None},
+    {"name": "ratchet 30/20/13 @+100/300% (live tiers)", "rule": "ratchet", "tiers": [(1.00, 0.30), (3.00, 0.20), (INF, 0.13)], "target": None},
+    {"name": "ratchet 40/25/15 @+15/35%", "rule": "ratchet", "tiers": [(0.15, 0.40), (0.35, 0.25), (INF, 0.15)], "target": None},
+    {"name": "ratchet 40/20/12 @+20/50%", "rule": "ratchet", "tiers": [(0.20, 0.40), (0.50, 0.20), (INF, 0.12)], "target": None},
+    {"name": "ratchet 30/15/10 @+15/40%", "rule": "ratchet", "tiers": [(0.15, 0.30), (0.40, 0.15), (INF, 0.10)], "target": None},
 ]
 
 
@@ -76,19 +85,25 @@ def sim_intraday(tk, entry_S, entry_dt, bars, base_iv, pol):
         ph = pr.bs_call_price(h, strike, T, iv, R)            # premium at the bar HIGH
         pl = pr.bs_call_price(l, strike, T, iv, R)            # at the LOW
         pc = pr.bs_call_price(c, strike, T, iv, R)            # at the close
-        if ph > peak:
-            peak = ph
-        stop = peak * (1 - pol["trail"])
-        if pol["rule"] == "trail_breakeven" and (peak / entry_prem - 1) >= pol["be_arm"]:
-            stop = max(stop, entry_prem * (1 + pol["be_lock"]))
+        # Stop uses the peak from PRIOR bars: this bar's high may NOT tighten a stop that the same bar's
+        # low then breaches (that within-bar capture inflated tight trails). This bar's high only raises
+        # the peak for the NEXT bar's stop.
+        if pol["rule"] == "ratchet":
+            tr = next(t for thresh, t in pol["tiers"] if (peak / entry_prem - 1) < thresh)
+            stop = peak * (1 - tr)
+        else:
+            stop = peak * (1 - pol["trail"])
+            if pol["rule"] == "trail_breakeven" and (peak / entry_prem - 1) >= pol["be_arm"]:
+                stop = max(stop, entry_prem * (1 + pol["be_lock"]))
         hit_stop = pl <= stop
         hit_tp = pol["target"] and ph >= entry_prem * (1 + pol["target"])
-        # Intra-bar path order is unknown; TP_FIRST=1 = optimistic (limit fills before stop), else
-        # pessimistic (stop first). The truth is between — brackets the take-profit estimate.
+        # Intra-bar order unknown; TP_FIRST=1 = optimistic (limit before stop), else pessimistic.
         if hit_tp and (TP_FIRST or not hit_stop):
             exit_prem, reason = entry_prem * (1 + pol["target"]), "take_profit"; break
         if hit_stop:
             exit_prem, reason = stop, pol["rule"]; break
+        if ph > peak:                                          # only now: raise peak for the NEXT bar
+            peak = ph
         exit_prem = pc                                        # else mark at close, keep holding
     if exit_prem is None:
         exit_prem = entry_prem
