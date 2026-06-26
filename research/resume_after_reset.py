@@ -19,9 +19,10 @@ CACHE = os.path.join(DIR, "data", "groq_primary_backtest_cache.json")   # data/c
 STOP = os.path.join(DIR, "data", "resume_after_reset.stop")
 PY = os.path.join(DIR, ".venv/bin/python")
 TOTAL_PER_MODEL = 1900                 # universe ~1906; treat ≥this as complete (a few articles drop out)
-# Completion gates on 8b + gpt-oss-120b — scout dropped (deprecation), 70b can't finish on free tier.
-# 70b still gets scored opportunistically; its partial data shows in reports.
-MODELS = ("llama-3.1-8b", "gpt-oss-120b")
+# Completion gates on gpt-oss-20b + gpt-oss-120b — scout AND llama-3.1-8b dropped (Groq deprecations,
+# 8b on 2026-06-25 → replaced by gpt-oss-20b); 70b can't finish on free tier but is scored
+# opportunistically and its partial data shows in reports.
+MODELS = ("gpt-oss-20b", "gpt-oss-120b")
 MAX_CYCLES = 14
 
 

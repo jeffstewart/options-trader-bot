@@ -33,8 +33,9 @@ PACE = 0.2                    # sleep between calls — avoid RPM/TPM bursts
 END = datetime.now(timezone.utc) - timedelta(days=5)
 SYS = PROMPTS["materiality_fewshot"]
 SCORES_PATH = "prompt_exp_scores.json"
-_DEFAULT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile",
-                   "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b",
+# llama-3.1-8b-instant (dep. 2026-06-25) + llama-4-scout (dep. 2026-06-24) removed; gpt-oss-20b is the
+# cheap-tier replacement Groq recommends.
+_DEFAULT_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b",
                    "openai/gpt-oss-120b", "qwen/qwen3-32b"]
 MODELS = [m.strip() for m in os.environ.get("GS_MODELS", ",".join(_DEFAULT_MODELS)).split(",") if m.strip()]
 INCLUDE_OLLAMA = os.environ.get("GS_OLLAMA", "1") == "1"

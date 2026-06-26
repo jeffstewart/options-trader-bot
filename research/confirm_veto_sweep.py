@@ -32,7 +32,7 @@ MODELS = [
     ("groq/gpt-oss-20b",    "openai/gpt-oss-20b",      "groq",  8, None),
     ("groq/qwen3.6-27b",    "qwen/qwen3.6-27b",        "groq",  6, None),
     ("groq/qwen3-32b",      "qwen/qwen3-32b",          "groq", 10, None),
-    ("groq/llama-3.1-8b",   "llama-3.1-8b-instant",    "groq",  4, None),
+    # llama-3.1-8b removed 2026-06-25 (Groq deprecation → gpt-oss-20b above) · llama-4-scout deprecated 2026-06-24
     ("groq/llama-4-scout",  "meta-llama/llama-4-scout-17b-16e-instruct", "groq", 4, None),
     ("mistral-small",       "mistral-small-latest",    "mistral", 3, None),
     ("mistral-medium",      "mistral-medium-latest",   "mistral", 3, None),

@@ -22,9 +22,11 @@ import confirm_veto_sweep as cvs
 
 # (display, model_id, pace_seconds, extra_params) — pace tuned to each model's RPM headroom.
 # llama-4-scout DROPPED 2026-06-24 (Groq deprecating it); its 1,287 cached scores stay for reference.
+# llama-3.1-8b DROPPED 2026-06-25 (Groq deprecating it); replaced by gpt-oss-20b (Groq's recommended
+# successor). Its prior scores stay cached but are no longer gathered/reported.
 # gpt-oss-120b ADDED 2026-06-24 with reasoning_effort=low → 100% clean parse @ ~565ms (validated).
 MODELS = [("llama-3.3-70b", "llama-3.3-70b-versatile", 3, None),                   # ~1k/day, low RPM
-          ("llama-3.1-8b",  "llama-3.1-8b-instant",    9, None),                   # 14.4k/day, TPM=6000 → 9s
+          ("gpt-oss-20b",   "openai/gpt-oss-20b",      8, {"reasoning_effort": "low"}),  # 8b replacement
           ("gpt-oss-120b",  "openai/gpt-oss-120b",     8, {"reasoning_effort": "low"})]
           # gpt-oss limits: 30 RPM, 1k RPD, 8k TPM, 200k TPD · ~967 tok/req → TPM binds at ~8/min (8s
           # pace) and TPD caps at ~207/day → full ~1.7k-article set ≈ 8-9 days of resets via scheduler.
@@ -56,7 +58,8 @@ def seed(sc):
     take("confirm_veto_sweep_cache.json", "groq/llama-4-scout:",      "llama-4-scout")
     take("confirm_veto_sweep_cache.json", "groq/llama-3.3-70b:",      "llama-3.3-70b")
     take("groq_value_cache.json",         "llama-3.3-70b-versatile:", "llama-3.3-70b")
-    take("confirm_veto_sweep_cache.json", "groq/llama-3.1-8b:",       "llama-3.1-8b")
+    take("confirm_veto_sweep_cache.json", "groq/gpt-oss-20b:",        "gpt-oss-20b")   # 8b replacement
+    take("overnight_cv_cache.json",       "groq/gpt-oss-20b:",        "gpt-oss-20b")
     take("overnight_cv_cache.json",       "groq/gpt-oss-120b:",       "gpt-oss-120b")
     take("confirm_veto_sweep_cache.json", "groq/gpt-oss-120b:",       "gpt-oss-120b")
     take("groq_value_cache.json",         "openai/gpt-oss-120b:",     "gpt-oss-120b")
