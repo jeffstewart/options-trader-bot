@@ -128,9 +128,32 @@ def cap_section():
     print(f"  open positions: {len(pos)} / {c.MAX_OPEN_POSITIONS} cap → {c.MAX_OPEN_POSITIONS - len(pos)} free slots")
 
 
+def health_section():
+    """Unattended-run health: are the daemons up, and did the watchdog have to intervene today?
+    Lets a scan of N days of EOD reports surface crashes/restarts without digging logs."""
+    hdr("BOT HEALTH (unattended)")
+    for n in ("bot", "dashboard", "resume_after_reset"):
+        try:
+            pid = int(open(c.DATA_DIR / f"{n}.pid").read().strip())
+            os.kill(pid, 0); st = "UP"
+        except Exception:
+            st = "DOWN"
+        print(f"  {n:20} {st}")
+    try:
+        lines = open(c.LOG_DIR / "watchdog.log").read().splitlines()
+        today = [l for l in lines if l.startswith(f"[{TODAY}")]
+        restarts = [l for l in today if "restarting" in l]
+        rotations = [l for l in today if "rotated" in l]
+        print(f"  watchdog today: {len(restarts)} restart(s), {len(rotations)} log rotation(s)")
+        for l in restarts[-4:]:
+            print(f"     {l}")
+    except Exception:
+        print("  watchdog log: (none yet)")
+
+
 def main():
     print(f"════════════ EOD REPORT — {TODAY} ════════════")
-    for fn in (account_section, trades_today, closes_today, gate_section, shadow_stock_section, cap_section):
+    for fn in (health_section, account_section, trades_today, closes_today, gate_section, shadow_stock_section, cap_section):
         try:
             fn()
         except Exception as e:
