@@ -12,6 +12,29 @@ start_bot()   { spawn $ROOT/data/bot.pid                $ROOT/logs/bot.log      
 start_dash()  { spawn $ROOT/data/dashboard.pid          $ROOT/logs/dashboard.log          $PY -u $ROOT/core/dashboard.py; }
 start_sched() { spawn $ROOT/data/resume_after_reset.pid $ROOT/logs/resume_after_reset.log $PY -u $ROOT/research/resume_after_reset.py; }
 
+WDLOG=$ROOT/logs/watchdog.log
+wlog() { echo "[$(date '+%F %T')] $1" >> $WDLOG; }
+
+is_up() { local p=$(cat $ROOT/data/$1.pid 2>/dev/null); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+
+# Restart a daemon if its pidfile process is gone. $1=pidfile-name $2=start-fn
+ensure() { if ! is_up "$1"; then wlog "$1 DOWN → restarting"; $2 || wlog "$1 restart FAILED"; fi; }
+
+# Keep the Mac awake (sleep would freeze trading + data capture). Persists past any Claude session.
+ensure_caffeinate() { pgrep -x caffeinate >/dev/null 2>&1 || { nohup caffeinate -dimsu >/dev/null 2>&1 & wlog "started caffeinate (sleep prevention)"; }; }
+
+# Copy-truncate growing logs to the last 50k lines once they exceed 150MB (Python append-mode → safe).
+rotate_logs() {
+  for lf in bot dashboard ollama groq_backtest; do
+    local f=$ROOT/logs/$lf.log
+    [[ -f $f ]] || continue
+    local sz=$(stat -f%z "$f" 2>/dev/null || echo 0)
+    if (( sz > 157286400 )); then
+      tail -n 50000 "$f" > "$f.tmp" 2>/dev/null && cp "$f.tmp" "$f" && rm -f "$f.tmp" && wlog "rotated $lf.log (was $((sz/1048576))MB)"
+    fi
+  done
+}
+
 case "$1" in
   start)
     start_bot; start_dash; sleep 2
@@ -29,6 +52,15 @@ case "$1" in
       p=$(cat $ROOT/data/$n.pid 2>/dev/null)
       if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then echo "  $n: UP (pid $p)"; else echo "  $n: down"; fi
     done ;;
+  restart-dash) pkill -f 'core/dashboard.py' 2>/dev/null || true; sleep 2; start_dash; echo "dashboard restarted" ;;
+  watchdog)
+    # Run every few minutes (LaunchAgent / cron) for unattended operation: restart any down daemon,
+    # keep the Mac awake, and cap log growth. Idempotent — only acts when something is wrong.
+    ensure bot start_bot
+    ensure dashboard start_dash
+    ensure resume_after_reset start_sched
+    ensure_caffeinate
+    rotate_logs ;;
   test) $PY -m pytest ;;
-  *) echo "usage: ./manage.sh {start|sched|stop|restart-bot|status|test}" ;;
+  *) echo "usage: ./manage.sh {start|sched|stop|restart-bot|restart-dash|watchdog|status|test}" ;;
 esac

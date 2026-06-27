@@ -2927,7 +2927,8 @@ async def process_signal(headline: str, body: str, source: str,
     # pead) are leveraged long-beta — only open them in an uptrend (index > 200d
     # SMA). Pairs/bear_short above already ran regardless of regime.
     regime_bypass = False
-    if not market_in_uptrend():
+    _up = market_in_uptrend()
+    if not _up:
         # High-conviction bypass: strong idiosyncratic catalysts (mag ≥ threshold) clear the regime
         # filter even in a downtrend — backtested to stay profitable on options in down-regimes incl.
         # the 2022 bear. BUT a downtrend bypass now REQUIRES an explicit CONFIRM from the secondary
@@ -2941,7 +2942,10 @@ async def process_signal(headline: str, body: str, source: str,
         else:
             log.info("  → downtrend (regime filter) — skipping long-beta strategies "
                      "(pairs/bear_short still active)")
+            _log_regime_decision(signal, _up, bypass=False)      # capture the BLOCK (data, survives log rotation)
             return
+    signal["_regime"] = "downtrend-bypass" if regime_bypass else "uptrend"
+    _log_regime_decision(signal, _up, bypass=regime_bypass)
 
     # Compute scaled position size once for this signal
     option_usd = scale_position_usd(MAX_POSITION_USD, magnitude, confidence)
@@ -3195,6 +3199,26 @@ async def newsapi_poller():
 # TRADE LOG
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _log_regime_decision(signal, in_uptrend, bypass):
+    """Persist the regime context of each long-beta signal that reached the regime gate. bot.log gets
+    rotated (watchdog), so this CSV is the durable record for validating the forward bypass P&L (the
+    downtrend mag≥0.85 trades). Join to trades.csv/closed_trades.csv by ticker+time. in_uptrend=0 &
+    bypass=0 = a BLOCKED signal (didn't trade); bypass=1 = traded into a downtrend."""
+    try:
+        new = not os.path.exists("regime_decisions.csv")
+        with open("regime_decisions.csv", "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["ts", "tickers", "in_uptrend", "bypass", "magnitude", "confidence", "headline"])
+            w.writerow([datetime.now(timezone.utc).isoformat(),
+                        "|".join((signal.get("tickers") or [])[:2]),
+                        int(bool(in_uptrend)), int(bool(bypass)),
+                        signal.get("magnitude"), signal.get("confidence"),
+                        (signal.get("reasoning", "") or "")[:80]])
+    except Exception as e:
+        log.debug("regime-decision log failed: %s", e)
+
+
 def log_trade(ticker, contract, qty, signal, entry_price, strategy="news_call"):
     path = "trades.csv"
     write_header = not os.path.exists(path)
@@ -3279,22 +3303,21 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _supervised_monitor():
-    """Keep the trailing-stop monitor alive. It's one of several coroutines in asyncio.gather, so an
-    unhandled exception in a cycle (a transient Alpaca/quote error the cycle didn't catch) would
-    propagate through gather → asyncio.run → KILL THE WHOLE BOT (the 2026-06-25 ConnectionReset crash).
-    This restarts the loop instead; module-global state (_monitored_positions, _postclose) means a
-    restart resumes cleanly. CancelledError still propagates so shutdown works."""
+async def _supervised(make_coro, name):
+    """Keep a long-running coroutine alive. Every task here lives under one asyncio.gather, so a single
+    unhandled exception would propagate through gather → asyncio.run → KILL THE WHOLE BOT (the 06-25
+    ConnectionReset crash). This restarts the task instead; module-global state (_monitored_positions,
+    _postclose, etc.) means a restart resumes cleanly. CancelledError still propagates for shutdown.
+    The external watchdog (manage.sh) is the backstop if the whole process dies."""
     while True:
         try:
-            await trailing_stop_monitor()
-            return                                    # clean exit (the loop is while True → never)
+            await make_coro()
+            log.warning("⚠️ %s exited cleanly — restarting in 5s", name)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.error("⚠️ trailing_stop_monitor crashed (%s: %s) — restarting in 5s; positions remain "
-                      "held, monitoring resumes next cycle", type(e).__name__, e)
-            await asyncio.sleep(5)
+            log.error("⚠️ %s crashed (%s: %s) — restarting in 5s", name, type(e).__name__, e)
+        await asyncio.sleep(5)
 
 
 async def main():
@@ -3342,11 +3365,11 @@ async def main():
 
     log.info("📡 All news sources starting…")
     await asyncio.gather(
-        stream._run_forever(),
-        stock_stream._run_forever(),
-        _supervised_monitor(),
-        sec_rss_poller(),
-        newsapi_poller(),
+        _supervised(stream._run_forever,       "news stream"),
+        _supervised(stock_stream._run_forever, "stock stream"),
+        _supervised(trailing_stop_monitor,     "trailing-stop monitor"),
+        _supervised(sec_rss_poller,            "SEC RSS poller"),
+        _supervised(newsapi_poller,            "NewsAPI poller"),
     )
 
 if __name__ == "__main__":
