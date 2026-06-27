@@ -191,7 +191,7 @@ def long_trail_for(strategy: str, asset_type: str, gain: float) -> float:
         return pead_trail_pct(gain)
     if strategy == "lotto":
         return lotto_trail_pct(gain)
-    if strategy == "news_call":
+    if strategy in ("news_call", "regime_block"):   # regime_block shadow exits like the real news_call
         return news_call_trail_pct(gain)    # RATCHET (2026-06-26): 40/25/15 by peak-gain @ +15/+35%
     if strategy == "pairs_long":
         return PAIRS_LONG_TRAIL
@@ -212,7 +212,7 @@ def max_hold_days_for(strategy: str, asset_type: str) -> int:
         return PEAD_MAX_HOLD_DAYS
     if strategy == "lotto":
         return LOTTO_MAX_HOLD_DAYS
-    if strategy == "news_call":
+    if strategy in ("news_call", "regime_block"):   # regime_block = a would-be news_call shadow → same exit
         return NEWS_CALL_MAX_HOLD_DAYS      # 3d cap (exit sweep) — short-dated Δ0.40/DTE10 calls
     return 0   # pairs, bear_short, qqq_macro: no time cap
 
@@ -1804,12 +1804,13 @@ def _open_shadow(base_strategy: str, ticker: str, stock_price: float, contract: 
     log.info("  👻 shadow %s: %s x%d @ $%.4f (paper, no order) [%s_shadow]",
              base_strategy, sym, qty, entry, base_strategy)
 
-def shadow_news_call_fn(ticker: str, signal: dict, option_usd: float):
-    """Paper-only: shadow the contract news_call WOULD buy on signals it does NOT trade
-    (mag<NEWS_CALL_MIN_MAGNITUDE now that news_call is live). Uses the SAME news_call geometry
-    (Δ0.40/DTE~10) so the forward shadow data is faithful to the real leg."""
+def shadow_news_call_fn(ticker: str, signal: dict, option_usd: float, tag: str = "news_call"):
+    """Paper-only: shadow the contract news_call WOULD buy on signals it does NOT trade. Uses the SAME
+    news_call geometry (Δ0.40/DTE~10) so the forward shadow data is faithful to the real leg.
+    tag='news_call' = sub-threshold (mag<0.75) signals; tag='regime_block' = would-trade signals the
+    DOWNTREND regime gate blocked (validates the gate: did it block losers, or cost us winners?)."""
     try:
-        if _shadow_has_ticker("news_call", ticker):
+        if _shadow_has_ticker(tag, ticker):
             return
         stock_price = get_stock_price(ticker)
         if not stock_price or not passes_stock_price_guardrail(ticker, stock_price):
@@ -1828,7 +1829,7 @@ def shadow_news_call_fn(ticker: str, signal: dict, option_usd: float):
                       ticker, contract_cost, MAX_CONTRACT_BUDGET_MULT, option_usd)
             return
         qty = max(1, int(option_usd / contract_cost))
-        _open_shadow("news_call", ticker, stock_price, contract, qty, NEWS_CALL_TARGET_DELTA,
+        _open_shadow(tag, ticker, stock_price, contract, qty, NEWS_CALL_TARGET_DELTA,
                      (NEWS_CALL_DTE_MIN + NEWS_CALL_DTE_MAX) // 2)
     except Exception as e:
         log.debug("shadow news_call failed: %s", e)
@@ -2943,6 +2944,15 @@ async def process_signal(headline: str, body: str, source: str,
             log.info("  → downtrend (regime filter) — skipping long-beta strategies "
                      "(pairs/bear_short still active)")
             _log_regime_decision(signal, _up, bypass=False)      # capture the BLOCK (data, survives log rotation)
+            # Paper-track the would-be trades the regime gate blocks (mag≥ the live news_call bar) so we
+            # can later tell if the directional gate is blocking LOSERS (working) or WINNERS (too strict)
+            # — and whether the 0.85 bypass bar should move. Fire-and-forget → doesn't slow this hot path.
+            if NEWS_CALL_SHADOW_ENABLED and magnitude >= NEWS_CALL_MIN_MAGNITUDE:
+                _sz = scale_position_usd(MAX_POSITION_USD, magnitude, confidence)
+                _loop = asyncio.get_event_loop()
+                for _tk in (signal.get("tickers") or [])[:2]:
+                    if _tk not in ("BTC", "ETH"):
+                        _loop.run_in_executor(None, shadow_news_call_fn, _tk, signal, _sz, "regime_block")
             return
     signal["_regime"] = "downtrend-bypass" if regime_bypass else "uptrend"
     _log_regime_decision(signal, _up, bypass=regime_bypass)
