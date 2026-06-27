@@ -34,6 +34,7 @@ That's it. The watchdog runs every 5 min and is idempotent.
 | `position_paths.csv` | real ~30s premium path per position, `phase=open` and **`phase=postclose`** (for exit-rule replay) |
 | `gemini_decisions.csv` | every gate call: decision, latency, mags |
 | `regime_decisions.csv` | **NEW** — regime context per long-beta signal (in_uptrend, bypass, mag) → validate the bypass's forward P&L |
+| `shadow_trades.csv` | paper counterfactuals: stock / sub-threshold news_call / **regime_block** (would-be trades the downtrend gate blocked) / veto / lotto-OOW / pead |
 | `scorer_ab.csv` | Groq-vs-Ollama A/B |
 | `groq_primary_backtest_cache.json` | the primary-scorer backtest, accumulating via the scheduler |
 | `eod_reports/eod_YYYY-MM-DD.txt` | daily snapshot (account, trades, gate stats) via the EOD cron |
@@ -50,9 +51,11 @@ grep -c crashed logs/bot.log       # in-process supervisor catches (should be ~0
 
 ## Open questions queued for when the subscription is back
 
-1. **Validate the bypass's forward P&L** — join `regime_decisions.csv` (bypass=1) to closed trades. The
-   pre-defense record was a down-market loss; the post-2026-06-25 record (mistral-concur fail-closed) is
-   the real test. If bypassed downtrend trades keep losing, raise the 0.85 bar.
+1. **Validate the directional gate end-to-end** — (a) bypass P&L: join `regime_decisions.csv` (bypass=1)
+   to closed trades (post-2026-06-25 is the real test); (b) **the gate's counterfactual**: the new
+   `regime_block_shadow` rows in `shadow_trades.csv` show how the blocked would-be trades actually did —
+   if they're net losers the gate is working; if winners, the 0.85 bypass bar is too strict. Together
+   these calibrate the regime/bypass thresholds.
 2. **Re-evaluate the exit ratchet on real quotes** — `position_paths.csv` (open + postclose) replays
    live-40%-flat vs the deployed ratchet vs tighter, on actual 30s quotes.
 3. **Move the gate to a fast Groq production model** — once the primary-scorer backtest hits ~75%
