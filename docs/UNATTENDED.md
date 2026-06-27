@@ -39,6 +39,17 @@ That's it. The watchdog runs every 5 min and is idempotent.
 | `groq_primary_backtest_cache.json` | the primary-scorer backtest, accumulating via the scheduler |
 | `eod_reports/eod_YYYY-MM-DD.txt` | daily snapshot (account, trades, gate stats) via the EOD cron |
 
+## Stopping / pausing it (IMPORTANT gotcha)
+
+`./manage.sh stop` alone will NOT stop it — the watchdog cron restarts everything within 5 min.
+To actually stop:
+```bash
+crontab -l | grep -v 'manage.sh watchdog' | crontab -   # remove the watchdog first
+./manage.sh stop                                          # then stop the daemons
+pkill -x caffeinate                                       # (optional) let the Mac sleep again
+```
+To resume later: re-add the watchdog cron line (top of this doc), then `./manage.sh start && ./manage.sh sched`.
+
 ## Health check when you return
 
 ```bash
