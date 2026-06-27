@@ -3209,11 +3209,13 @@ def _log_regime_decision(signal, in_uptrend, bypass):
         with open("regime_decisions.csv", "a", newline="") as f:
             w = csv.writer(f)
             if new:
-                w.writerow(["ts", "tickers", "in_uptrend", "bypass", "magnitude", "confidence", "headline"])
+                w.writerow(["ts", "tickers", "in_uptrend", "bypass", "magnitude", "confidence",
+                            "catalyst", "headline"])
             w.writerow([datetime.now(timezone.utc).isoformat(),
                         "|".join((signal.get("tickers") or [])[:2]),
                         int(bool(in_uptrend)), int(bool(bypass)),
                         signal.get("magnitude"), signal.get("confidence"),
+                        signal.get("catalyst"),                 # resolved-event score → catalyst-gate analysis
                         (signal.get("reasoning", "") or "")[:80]])
     except Exception as e:
         log.debug("regime-decision log failed: %s", e)
