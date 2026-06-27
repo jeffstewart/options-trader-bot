@@ -53,6 +53,17 @@ case "$1" in
       if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then echo "  $n: UP (pid $p)"; else echo "  $n: down"; fi
     done ;;
   restart-dash) pkill -f 'core/dashboard.py' 2>/dev/null || true; sleep 2; start_dash; echo "dashboard restarted" ;;
+  backup)
+    # Off-machine backup to iCloud Drive (no remote / Time Machine). Code as a git bundle (full history,
+    # ~5MB), data/ + eod_reports mirrored. Run on demand or daily via run_eod.sh. ~67MB total.
+    BK="$HOME/Library/Mobile Documents/com~apple~CloudDocs/TraderBackup"
+    mkdir -p "$BK/data" "$BK/eod_reports"
+    git -C $ROOT bundle create "$BK/trader-code.bundle" --all >/dev/null 2>&1 && bundle_ok=1 || bundle_ok=0
+    rsync -a --delete --exclude '*.pid' $ROOT/data/ "$BK/data/" 2>/dev/null
+    rsync -a $ROOT/eod_reports/ "$BK/eod_reports/" 2>/dev/null
+    date '+%F %T' > "$BK/LAST_BACKUP.txt"
+    wlog "backup → iCloud (code bundle=$bundle_ok, data+eod mirrored)"
+    echo "backed up to $BK (code bundle=$bundle_ok)" ;;
   watchdog)
     # Run every few minutes (LaunchAgent / cron) for unattended operation: restart any down daemon,
     # keep the Mac awake, and cap log growth. Idempotent — only acts when something is wrong.
@@ -61,6 +72,7 @@ case "$1" in
     ensure resume_after_reset start_sched
     ensure_caffeinate
     rotate_logs ;;
+  report) ( cd $ROOT/data && USE_YAHOO_BARS=1 $PY $ROOT/research/status.py ) ;;
   test) $PY -m pytest ;;
-  *) echo "usage: ./manage.sh {start|sched|stop|restart-bot|restart-dash|watchdog|status|test}" ;;
+  *) echo "usage: ./manage.sh {start|sched|stop|restart-bot|restart-dash|watchdog|backup|report|status|test}" ;;
 esac

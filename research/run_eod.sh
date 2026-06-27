@@ -14,3 +14,5 @@ cat "$OUT" >> "$ROOT/eod_reports/eod_history.log"
 # daily free cap, resumes tomorrow). Finishes coverage over a few days, then just re-prints the compare.
 ( cd "$ROOT/data" && UNI_SAMPLE=1000 USE_YAHOO_BARS=1 "$PY" -u "$ROOT/research/gemini_batch_unified.py" ) \
     >> "$ROOT/eod_reports/gemini_unified_daily.log" 2>&1
+# Daily off-machine backup to iCloud (code bundle + data + eod_reports). No remote / Time Machine.
+"$ROOT/manage.sh" backup >> "$ROOT/logs/watchdog.log" 2>&1

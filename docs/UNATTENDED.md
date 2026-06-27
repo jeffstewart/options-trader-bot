@@ -50,15 +50,21 @@ pkill -x caffeinate                                       # (optional) let the M
 ```
 To resume later: re-add the watchdog cron line (top of this doc), then `./manage.sh start && ./manage.sh sched`.
 
-## Health check when you return
+## Health check — one command, any time
 
 ```bash
-cd /Users/jeff/Claude/Trader
-./manage.sh status                 # all 4 daemons UP?
-tail -20 logs/watchdog.log         # any restarts / rotations while away?
-ls -t eod_reports/ | head          # daily reports kept generating?
-grep -c crashed logs/bot.log       # in-process supervisor catches (should be ~0)
+cd /Users/jeff/Claude/Trader && ./manage.sh report
 ```
+`research/status.py` prints everything on demand: daemon health + uptime, disk, last backup, account +
+open positions, today's trades/closes, **realized P&L by strategy (7d/all)**, gate health, **DATA-CAPTURE
+freshness** (rows + last-write per file — confirm it's still collecting), Groq-backtest coverage, and
+shadow counts. The data-freshness block is the quickest "is it still working?" check.
+
+## Backup (automatic → iCloud)
+
+`./manage.sh backup` mirrors code (git bundle), `data/`, and `eod_reports/` to
+`~/Library/Mobile Documents/com~apple~CloudDocs/TraderBackup/`. Runs **daily** at the end of the EOD
+cron; run on demand any time. (No GitHub / Time Machine, so this is the only off-machine copy.)
 
 ## Open questions queued for when the subscription is back
 
