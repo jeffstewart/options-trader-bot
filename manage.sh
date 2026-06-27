@@ -20,8 +20,10 @@ is_up() { local p=$(cat $ROOT/data/$1.pid 2>/dev/null); [[ -n "$p" ]] && kill -0
 # Restart a daemon if its pidfile process is gone. $1=pidfile-name $2=start-fn
 ensure() { if ! is_up "$1"; then wlog "$1 DOWN → restarting"; $2 || wlog "$1 restart FAILED"; fi; }
 
-# Keep the Mac awake (sleep would freeze trading + data capture). Persists past any Claude session.
-ensure_caffeinate() { pgrep -x caffeinate >/dev/null 2>&1 || { nohup caffeinate -dimsu >/dev/null 2>&1 & wlog "started caffeinate (sleep prevention)"; }; }
+# Insurance against SYSTEM sleep (would freeze trading + data capture) in case the pmset 'sleep 0'
+# setting ever gets reset. Uses -i only (idle SYSTEM sleep) — NOT -d/-u, so the display still turns
+# off and the lock screen still engages. Persists past any Claude session.
+ensure_caffeinate() { pgrep -x caffeinate >/dev/null 2>&1 || { nohup caffeinate -i >/dev/null 2>&1 & wlog "started caffeinate -i (system-sleep insurance; display/lock unaffected)"; }; }
 
 # Copy-truncate growing logs to the last 50k lines once they exceed 150MB (Python append-mode → safe).
 rotate_logs() {
