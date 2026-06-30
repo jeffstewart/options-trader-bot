@@ -15,8 +15,14 @@ theorized); the total is pure tail (24/94 trades >+100%, e.g. SNOW $7.25→$67.7
 inflated by trades the live bot would REJECT — entry premiums down to $0.06 bought at qty 92 (the sim
 applies no MAX_SPREAD_PCT / open-interest / contract-budget guards). So options convert PEAD from a
 steady, high-Sharpe (3.61), 53%-win stock strategy into a lotto-style convex bet (42% win, median −24%).
-Verdict: the backtest can't settle it (tail-driven + execution-unrealistic). To actually decide, run a
-forward pead_options SHADOW using REAL quotes + the live execution guards. Keep PEAD as STOCK for now.
+UPDATE (2026-06-30, after a contract-selection sweep): GEOMETRY is decisive, and the totals misled —
+look at the MEDIAN + win% (robust to the tail). ATM/short (Δ0.50/21d) loses (median −24%, theta wins),
+but ITM/longer-DTE (Δ0.70/45d) flips POSITIVE: median +12%, 57% win — a BROAD-based edge (majority of
+trades win), not a tail mirage. Higher delta (stock-like, less theta) + longer expiry let the slow drift
+survive. Excluding junk contracts (prem≥$1, qty≤20) barely moved it, so it's not just the execution
+artifact. Verdict: PROMISING at ITM/longer-DTE — worth a forward pead_options SHADOW at ~Δ0.70/45d (NOT
+the ATM/short geometry). Totals stay tail-skewed + synthetic-priced, so the shadow on REAL quotes is the
+confirmation. (Keep the live PEAD leg as stock until the shadow confirms.)
 """
 import os
 os.environ.setdefault("USE_YAHOO_BARS", "1")
