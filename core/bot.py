@@ -66,6 +66,7 @@ from config import (
     TRAILING_STOP_PCT, EXIT_TIERS, MONITOR_INTERVAL,
     PEAD_EXIT_TIERS, PEAD_BREAKEVEN_LOCK, BEAR_SHORT_TRAIL_PCT, BEAR_SHORT_ENABLED,
     PEAD_MAX_POSITIONS, PEAD_SHADOW_ENABLED,
+    PEAD_OPTION_SHADOW_ENABLED, PEAD_OPTION_DELTA, PEAD_OPTION_DTE_MIN, PEAD_OPTION_DTE_MAX, PEAD_OPTION_TRAIL,
     PAIRS_ENABLED, PAIRS_LONG_TRAIL, PAIRS_SHORT_TRAIL,
     ROUTER_SHADOW_ENABLED,
     LOTTO_ENABLED, LOTTO_MIN_MAGNITUDE, LOTTO_MIN_CONFIDENCE, LOTTO_TARGET_DELTA,
@@ -193,6 +194,8 @@ def long_trail_for(strategy: str, asset_type: str, gain: float) -> float:
         return lotto_trail_pct(gain)
     if strategy in ("news_call", "regime_block"):   # regime_block shadow exits like the real news_call
         return news_call_trail_pct(gain)    # RATCHET (2026-06-26): 40/25/15 by peak-gain @ +15/+35%
+    if strategy == "pead_option":           # PEAD-as-options shadow → flat premium trail
+        return PEAD_OPTION_TRAIL
     if strategy == "pairs_long":
         return PAIRS_LONG_TRAIL
     if asset_type == "stock":
@@ -214,6 +217,8 @@ def max_hold_days_for(strategy: str, asset_type: str) -> int:
         return LOTTO_MAX_HOLD_DAYS
     if strategy in ("news_call", "regime_block"):   # regime_block = a would-be news_call shadow → same exit
         return NEWS_CALL_MAX_HOLD_DAYS      # 3d cap (exit sweep) — short-dated Δ0.40/DTE10 calls
+    if strategy == "pead_option":           # PEAD-as-options shadow → PEAD's 10d hold
+        return PEAD_MAX_HOLD_DAYS
     return 0   # pairs, bear_short, qqq_macro: no time cap
 
 
@@ -694,6 +699,8 @@ def pick_call_contract(ticker: str, stock_price: float,
                        dte_max: int = MAX_DAYS_TO_EXPIRY,
                        target_delta: float = TARGET_DELTA,
                        strike_hi_mult: float = 1.10,
+                       strike_lo_mult: float = 0.95,         # strike floor; lower → reach ITM strikes
+                       target_mult: float | None = None,     # if set, target strike = spot×target_mult (ITM<1)
                        for_shadow: bool = False) -> Optional[dict]:
     today   = date.today()
     min_exp = today + timedelta(days=dte_min)
@@ -706,7 +713,7 @@ def pick_call_contract(ticker: str, stock_price: float,
                 type=ContractType.CALL,
                 expiration_date_gte=min_exp,
                 expiration_date_lte=max_exp,
-                strike_price_gte=str(round(stock_price * 0.95, 2)),
+                strike_price_gte=str(round(stock_price * strike_lo_mult, 2)),
                 strike_price_lte=str(round(stock_price * strike_hi_mult, 2)),
             )
         )
@@ -722,7 +729,7 @@ def pick_call_contract(ticker: str, stock_price: float,
     # Sort: prefer the configured DTE target (mid of the expiry window), then
     # strike closest to target. Lower target_delta → strike further OTM (cheaper).
     dte_target = round((dte_min + dte_max) / 2)
-    target_strike = stock_price * (1 + (1 - target_delta) * 0.15)
+    target_strike = stock_price * target_mult if target_mult else stock_price * (1 + (1 - target_delta) * 0.15)
     contracts.sort(key=lambda c: (
         abs((datetime.strptime(str(c.expiration_date), "%Y-%m-%d").date() - today).days - dte_target),
         abs(float(c.strike_price) - target_strike),
@@ -1889,6 +1896,31 @@ def shadow_pead_fn(ticker: str, signal: dict, position_usd: float):
     except Exception as e:
         log.debug("shadow pead failed: %s", e)
 
+def shadow_pead_option_fn(ticker: str, signal: dict, option_usd: float):
+    """Paper-only: shadow PEAD as an ITM longer-DTE CALL (base_strategy='pead_option'). pead_options_test
+    found PEAD's slow drift survives theta only at ITM/longer-DTE (Δ0.70/~45d → median +12%, 57% win);
+    ATM/short loses. _run_shadow_monitor's option branch exits it like PEAD (10d hold + 40% premium
+    trail). The live PEAD leg stays STOCK — this just gathers the real-quote evidence to decide."""
+    try:
+        if not PEAD_OPTION_SHADOW_ENABLED or _shadow_has_ticker("pead_option", ticker):
+            return
+        stock_price = get_stock_price(ticker)
+        if not stock_price or not passes_stock_price_guardrail(ticker, stock_price):
+            return
+        contract = pick_call_contract(ticker, stock_price, PEAD_OPTION_DTE_MIN, PEAD_OPTION_DTE_MAX,
+                                      PEAD_OPTION_DELTA, strike_hi_mult=1.00, strike_lo_mult=0.85,
+                                      target_mult=0.94, for_shadow=True)    # ~6% ITM ≈ Δ0.70
+        if not contract:
+            return
+        contract_cost = contract["ask"] * 100
+        if contract_cost > option_usd * MAX_CONTRACT_BUDGET_MULT:     # same budget guard as the real legs
+            return
+        qty = max(1, int(option_usd / contract_cost))
+        _open_shadow("pead_option", ticker, stock_price, contract, qty, PEAD_OPTION_DELTA,
+                     (PEAD_OPTION_DTE_MIN + PEAD_OPTION_DTE_MAX) // 2)
+    except Exception as e:
+        log.debug("shadow pead_option failed: %s", e)
+
 def shadow_lotto_fn(ticker: str, stock_price: float):
     """Paper-only: shadow the lotto pick when the REAL lotto is blocked by the position
     cap — so a high-conviction lotto signal isn't lost. Respects the same hard $250 cap."""
@@ -2664,6 +2696,9 @@ def _shadow_vetoed_pick(loop, ticker: str, signal: dict, option_usd: float,
         if _is_earnings_headline(headline):
             await asyncio.wait_for(loop.run_in_executor(
                 None, shadow_pead_fn, ticker, signal, option_usd), timeout=30)
+            if PEAD_OPTION_SHADOW_ENABLED:        # PEAD-as-ITM-call shadow (Δ0.70/45d) — real-quote test
+                await asyncio.wait_for(loop.run_in_executor(
+                    None, shadow_pead_option_fn, ticker, signal, option_usd), timeout=30)
     return _run()
 
 # ── Materiality scorer — the LIVE lotto SELECTOR (v2, promoted 2026-06-12 after the THRESHOLD-GATE

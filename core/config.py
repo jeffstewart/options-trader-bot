@@ -522,6 +522,17 @@ PEAD_MAX_HOLD_DAYS       = 10  # 2026-06-14: exit_sweep_unified — 45d was too 
                               # trail lifts Sharpe 2.5→3.95 at similar $ (drift plays out faster than
                               # 45d). Was 45.
 
+# PEAD-as-OPTIONS forward shadow (2026-06-30). pead_options_test: PEAD's slow ~10d drift LOSES on ATM/
+# short-dated calls (theta), but is POSITIVE on ITM + longer-DTE (Δ0.70/45d → median +12%, 57% win — a
+# broad-based edge on the robust median/win view, not a tail mirage). Paper-track it on REAL quotes to
+# confirm before ever trading it live (the live PEAD leg stays STOCK). Held PEAD_MAX_HOLD_DAYS (10d) with
+# a 40% premium trail; DTE well clear of the hold so it can't expire mid-drift.
+PEAD_OPTION_SHADOW_ENABLED = True
+PEAD_OPTION_DELTA          = 0.70    # ITM — stock-like, low theta (the geometry the sweep favored)
+PEAD_OPTION_DTE_MIN        = 35      # ~45-DTE target
+PEAD_OPTION_DTE_MAX        = 55
+PEAD_OPTION_TRAIL          = 0.40    # premium trail (options ~5× more volatile than the 20% stock trail)
+
 # ── PEAD reserved sub-cap + shadow overflow (see MAX_OPEN_POSITIONS note) ───────
 # pead is the highest-Sharpe leg (4.2 on unified_v1) but fired once ever — starved by the
 # stock-leg flood at the shared cap. Give it dedicated slots: ≥2 entries/day × the full hold
