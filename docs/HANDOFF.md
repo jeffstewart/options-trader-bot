@@ -50,8 +50,13 @@ confirm/veto gate** (`anthropic_gate_bakeoff.py`: edge −1.1% at the live bar �
 gate), **and the live mistral gate hurts sonnet5's book** (`sonnet5_mistral_pipeline.py`, full 136-pick
 coverage after `score_sonnet5_gap_mistral.py`): mistral confirms 82%, but its vetoes had an 80% WIN
 rate → gate costs ~14% of total P&L by cutting winners. If sonnet5 goes primary: run UNGATED (also
-removes the ~20s gate-latency drag) or re-tune the gate for sonnet5's candidate mix. Deferred pending
-jeff's go-ahead (real per-call cost).
+removes the ~20s gate-latency drag) or re-tune the gate for sonnet5's candidate mix. **PLUS (2026-07-16):
+sonnet5 is far better at TICKER ATTRIBUTION** — on 1,682 shared articles Ollama makes lookalike errors
+(AAPL for Advance Auto Parts, BA for Boston Scientific, stale FB) and wrong-beneficiary errors (MSFT on
+Dell's Pentagon win — the live BEAM/VERA failure mode); on trade-relevant disagreements sonnet5's ticker
+returns +1.64% vs Ollama's +0.28% (3d avg, n=53), and its 52% no-ticker rate is correct conservatism
+(Ollama hallucinates tickers onto politics/fluff). The wrong-beneficiary mode isn't regexable — the
+scorer swap is the fix. Deferred pending jeff's go-ahead (real per-call cost).
 
 **Scoring flow (live, unchanged engine):** Ollama (`llama3.2`, unified_v1) scores every article →
 pre-score noise+soft-catalyst filters → regime gate (3 conditions above; NO bypass) → mistral-large
