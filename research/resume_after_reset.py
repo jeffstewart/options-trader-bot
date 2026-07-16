@@ -25,11 +25,38 @@ TOTAL_PER_MODEL = 1900                 # universe ~1906; treat ≥this as comple
 MODELS = ("gpt-oss-20b", "gpt-oss-120b")
 MAX_CYCLES = 14
 
+# How many times to retry a cache read if the file is empty or corrupt (concurrent write race).
+_CACHE_RETRIES = 5
+_CACHE_RETRY_DELAY = 3   # seconds between retries
+
+
+def _load_cache() -> dict:
+    """
+    Load the cache JSON with retry logic to handle concurrent write races.
+    The backtest daemon may be mid-write when we try to read, leaving an
+    empty or truncated file momentarily. Retries up to _CACHE_RETRIES times
+    before raising.
+    """
+    last_exc = None
+    for attempt in range(1, _CACHE_RETRIES + 1):
+        try:
+            with open(CACHE) as f:
+                content = f.read()
+            if not content.strip():
+                raise ValueError("cache file is empty")
+            return json.loads(content)
+        except (json.JSONDecodeError, ValueError) as e:
+            last_exc = e
+            if attempt < _CACHE_RETRIES:
+                log(f"cache read attempt {attempt}/{_CACHE_RETRIES} failed ({e}) — retrying in {_CACHE_RETRY_DELAY}s")
+                time.sleep(_CACHE_RETRY_DELAY)
+    raise last_exc
+
 
 def counts():
     if not os.path.exists(CACHE):
         return {m: 0 for m in MODELS}, 0
-    d = json.load(open(CACHE))
+    d = _load_cache()
     c = {m: sum(1 for k, v in d.items() if v and k.startswith(m + ":")) for m in MODELS}
     return c, sum(1 for v in d.values() if v is None)
 
@@ -37,7 +64,7 @@ def counts():
 def clear_nones():
     if not os.path.exists(CACHE):
         return 0
-    d = json.load(open(CACHE)); before = len(d)
+    d = _load_cache(); before = len(d)
     d = {k: v for k, v in d.items() if v is not None}
     json.dump(d, open(CACHE, "w"))
     return before - len(d)
