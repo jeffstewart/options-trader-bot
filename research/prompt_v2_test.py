@@ -122,6 +122,88 @@ def report_ticker_only(set_a, sc):
         print(f"  latency: avg {statistics.mean(lats):.1f}s  p50 {statistics.median(lats):.1f}s")
 
 
+# ── COT hypothesis test (COT_TEST=1) ────────────────────────────────────────────────────────────
+# v2's categorical magnitude collapsed to 91% "high" on set B (schema-anchoring, same mechanism as
+# the confidence-float echo). Single-variable change: force 2-3 reasoning bullets BEFORE the
+# magnitude field (so those tokens generate first) — same category defs, same set B, nothing else
+# changed. Tests whether reasoning-before-judgment breaks the anchor, or whether it's structural
+# and survives reordering. (Suggested by an external LLM's prompt; most of that prompt re-tested
+# already-falsified field shapes — probability_up_3d/confidence/materiality/new_information all
+# match fields we'd already shown collapse, and free ticker generation is a regression from the
+# selection-from-candidates fix — so only this one isolated, previously-untested mechanism is
+# worth spending GPU time on.)
+COT_PROMPT = """You are a financial news analyst. Respond with a JSON object ONLY — no markdown, no explanation outside the JSON.
+
+First think step by step in the "reasoning" field (2-3 short bullets): what concretely happened, how
+large it is in scale relative to the company, and whether this type of event is routine or unusual.
+Base "magnitude" STRICTLY on those bullets — do not default to a single common answer regardless of
+the article.
+
+Schema:
+{
+  "reasoning":  ["bullet 1", "bullet 2", "bullet 3"],
+  "sentiment":  "bullish" | "bearish" | "neutral",
+  "magnitude":  "low" | "medium" | "high"
+}
+
+magnitude:
+  low    = routine or noise (minor updates, opinions, recaps, listicles, analyst ratings)
+  medium = meaningful catalyst (solid earnings beat, notable partnership, guidance change)
+  high   = major, company-defining event (transformative deal, landmark approval, huge beat)"""
+
+
+def score_cot(cli, art):
+    t0 = time.time()
+    raw = cli.chat.completions.create(
+        model=MODEL, temperature=0.1, max_tokens=300,
+        messages=[{"role": "system", "content": COT_PROMPT},
+                  {"role": "user", "content": f"Headline: {art['h']}\n\nBody: {art['body']}\n\nRespond with JSON only."}],
+    ).choices[0].message.content.strip()
+    lat = time.time() - t0
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return None, lat
+    try:
+        o = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None, lat
+    return {"sent": str(o.get("sentiment", "")).lower(), "mag": str(o.get("magnitude", "")).lower(),
+            "reasoning": o.get("reasoning")}, lat
+
+
+def report_cot(set_b, sc):
+    print("\n══ COT HYPOTHESIS — reasoning-before-magnitude vs v2 direct-magnitude (set B) ══")
+    rows = [(a, sc.get(f"cot:{a['ck']}")) for a in set_b]
+    rows = [(a, v) for a, v in rows if v]
+    bull = [(a, v) for a, v in rows if v["sent"] == "bullish" and a["r3"] is not None]
+    print(f"  n={len(rows)} scored · {len(bull)} bullish with r3")
+    from collections import Counter
+    dist = Counter(v["mag"] for a, v in bull)
+    print(f"  magnitude distribution (COT): {dict(dist)}")
+    print(f"  magnitude distribution (v2, for reference): medium=11 high=106 (91% high, n=117)")
+    for m in ("low", "medium", "high"):
+        xs = [a["r3"] for a, v in bull if v["mag"] == m]
+        if xs:
+            win = sum(1 for x in xs if x > 0) / len(xs) * 100
+            print(f"  {m:8} n={len(xs):<4} avg r3 {statistics.mean(xs):+.2f}%  med {statistics.median(xs):+.2f}%  win {win:.0f}%")
+        else:
+            print(f"  {m:8} n=0")
+    print(f"\n  sample reasoning (to sanity-check it isn't also templated/generic):")
+    for a, v in bull[:5]:
+        print(f"    [{v['mag']}] {a['h'][:60]}")
+        for b in (v.get("reasoning") or [])[:3]:
+            print(f"        - {b}")
+    lats = [v for k, v in sc.items() if k.startswith("latc:")]
+    if lats:
+        print(f"\n  latency: avg {statistics.mean(lats):.1f}s  p50 {statistics.median(lats):.1f}s")
+    fails = sum(1 for a in set_b if sc.get(f"cot:{a['ck']}", "miss") is None)
+    print(f"  parse failures: {fails}/{len(set_b)}")
+
+
 def load_full_sets():
     """FULL_TEST sets: every article with feed candidates + a sonnet5 reference.
     easy  = v1-Ollama already agreed with sonnet5 (selection must not BREAK these)
@@ -317,6 +399,26 @@ def main():
     set_a, set_b = load_sample()
     print(f"set A (ticker hard cases): {len(set_a)} · set B (random w/ r3): {len(set_b)}")
     sc = json.load(open(CACHE)) if os.path.exists(CACHE) else {}
+
+    if os.environ.get("COT_TEST") == "1":
+        if os.environ.get("REPORT_ONLY") != "1":
+            cli = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+            todo = [a for a in set_b if f"cot:{a['ck']}" not in sc]
+            print(f"COT test — to score: {len(todo)}")
+            for i, art in enumerate(todo):
+                try:
+                    res, lat = score_cot(cli, art)
+                except Exception as e:
+                    print(f"  [{i+1}] error: {e}", flush=True)
+                    continue
+                sc[f"cot:{art['ck']}"] = res
+                sc[f"latc:{art['ck']}"] = round(lat, 2)
+                if (i + 1) % 25 == 0:
+                    json.dump(sc, open(CACHE, "w"))
+                    print(f"  {i+1}/{len(todo)}", flush=True)
+            json.dump(sc, open(CACHE, "w"))
+        report_cot(set_b, sc)
+        return
 
     if os.environ.get("FULL_TEST") == "1":
         easy, hard, none_sample = load_full_sets()
