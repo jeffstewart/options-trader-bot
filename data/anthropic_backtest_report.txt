@@ -1,0 +1,154 @@
+Loading universe…
+  1461 articles with Ollama scores + forward returns
+Loading Anthropic scores…
+  haiku: 1684 scored
+  sonnet5: 1682 scored
+
+Ollama baseline trades (mag≥0.75): 276
+
+  ══ A) FIXED THRESHOLD COMPARISON ══
+  universe 1461 articles · Ollama gate: bullish & mag≥0.75
+  Anthropic gate: bullish & mag≥0.45 & conf≥0.60  (current bot thresholds)
+
+  OLLAMA baseline (mag≥0.75)                 n=276  Σ  +851.7%  avg +3.09%  win  68%  sharpe+0.31
+
+  [haiku]  coverage 1253/1461 (86%)
+  haiku (mag≥0.45, conf≥0.60)                n=291  Σ  +981.4%  avg +3.37%  win  70%  sharpe+0.33
+      └ haiku-only (Ollama skips → MISSED?)    n=179  Σ  +475.8%  avg +2.66%  win  70%  sharpe+0.42
+      └ Ollama-only (haiku skips → AVOIDED?)   n=64   Σ  +175.1%  avg +2.74%  win  69%  sharpe+0.55
+
+  [sonnet5]  coverage 1251/1461 (86%)
+  sonnet5 (mag≥0.45, conf≥0.60)              n=136  Σ  +641.8%  avg +4.72%  win  71%  sharpe+0.35
+      └ sonnet5-only (Ollama skips → MISSED?)  n=55   Σ  +187.5%  avg +3.41%  win  71%  sharpe+0.52
+      └ Ollama-only (sonnet5 skips → AVOIDED?) n=95   Σ  +226.4%  avg +2.38%  win  67%  sharpe+0.43
+
+  ══ B) MATCHED SELECTIVITY (top-N by magnitude, N = Ollama trade count) ══
+     Fair pick-quality test — equal trade count, best avg return wins.
+
+  [haiku]  matched N=176 (common scored set 1253)
+      Ollama top-N (mag≥0.75)                  n=176  Σ  +680.7%  avg +3.87%  win  69%  sharpe+0.32
+      haiku top-N (≈mag≥0.55)                  n=176  Σ  +411.6%  avg +2.34%  win  71%  sharpe+0.43
+
+  [sonnet5]  matched N=176 (common scored set 1251)
+      Ollama top-N (mag≥0.75)                  n=176  Σ  +680.7%  avg +3.87%  win  69%  sharpe+0.32
+      sonnet5 top-N (≈mag≥0.40)                n=176  Σ  +715.6%  avg +4.07%  win  71%  sharpe+0.33
+
+  ══ C) CONFIDENCE THRESHOLD SWEEP (mag≥0.40 fixed, conf swept) ══
+     Find the confidence cutoff that maximises each metric.
+     Ollama baseline: n=276  avg=+3.09%
+
+  [haiku]  (mag≥0.40 fixed)
+   conf≥      n    total%     avg%    win%   sharpe
+  ----------------------------------------------
+    0.00    291    +981.4%    +3.37%     70%    +0.33
+    0.05    291    +981.4%    +3.37%     70%    +0.33
+    0.10    291    +981.4%    +3.37%     70%    +0.33
+    0.15    291    +981.4%    +3.37%     70%    +0.33
+    0.20    291    +981.4%    +3.37%     70%    +0.33
+    0.25    291    +981.4%    +3.37%     70%    +0.33
+    0.30    291    +981.4%    +3.37%     70%    +0.33
+    0.35    291    +981.4%    +3.37%     70%    +0.33  ← best Sharpe
+    0.40    291    +981.4%    +3.37%     70%    +0.33
+    0.45    291    +981.4%    +3.37%     70%    +0.33
+    0.50    291    +981.4%    +3.37%     70%    +0.33
+    0.55    291    +981.4%    +3.37%     70%    +0.33
+    0.60    291    +981.4%    +3.37%     70%    +0.33
+    0.65    290    +978.1%    +3.37%     70%    +0.33
+    0.70    262    +876.0%    +3.34%     71%    +0.32
+    0.75    158    +577.8%    +3.66%     68%    +0.29
+    0.80     19     +23.3%    +1.22%     47%    +0.19
+    0.85     19     +23.3%    +1.22%     47%    +0.19  ← best avg/trade | ← best total P&L
+    0.90      0      +0.0%    +0.00%      0%    +0.00
+    0.95      0      +0.0%    +0.00%      0%    +0.00
+    1.00      0      +0.0%    +0.00%      0%    +0.00
+
+  [sonnet5]  (mag≥0.40 fixed)
+   conf≥      n    total%     avg%    win%   sharpe
+  ----------------------------------------------
+    0.00    215    +776.9%    +3.61%     69%    +0.32
+    0.05    215    +776.9%    +3.61%     69%    +0.32
+    0.10    215    +776.9%    +3.61%     69%    +0.32
+    0.15    215    +776.9%    +3.61%     69%    +0.32
+    0.20    215    +776.9%    +3.61%     69%    +0.32
+    0.25    215    +776.9%    +3.61%     69%    +0.32
+    0.30    215    +776.9%    +3.61%     69%    +0.32
+    0.35    215    +776.9%    +3.61%     69%    +0.32
+    0.40    215    +776.9%    +3.61%     69%    +0.32
+    0.45    213    +776.6%    +3.65%     69%    +0.32
+    0.50    212    +773.2%    +3.65%     69%    +0.32
+    0.55    209    +769.9%    +3.68%     69%    +0.32
+    0.60    158    +675.5%    +4.28%     70%    +0.34
+    0.65    132    +592.6%    +4.49%     68%    +0.33
+    0.70     84    +337.5%    +4.02%     71%    +0.56  ← best Sharpe
+    0.75     55    +244.5%    +4.44%     69%    +0.56
+    0.80     14     +39.6%    +2.83%     64%    +0.49  ← best avg/trade | ← best total P&L
+    0.85      8      -0.4%    -0.05%     38%    -0.01
+    0.90      0      +0.0%    +0.00%      0%    +0.00
+    0.95      0      +0.0%    +0.00%      0%    +0.00
+    1.00      0      +0.0%    +0.00%      0%    +0.00
+
+  ══ D) MAGNITUDE THRESHOLD SWEEP (conf≥0.60 fixed, mag swept) ══
+     Find where the magnitude bar maximises quality without killing volume.
+
+  [haiku]  (conf≥0.60 fixed)
+    mag≥      n    total%     avg%    win%   sharpe
+  ----------------------------------------------
+    0.00    349   +1151.7%    +3.30%     71%    +0.34
+    0.05    349   +1151.7%    +3.30%     71%    +0.34
+    0.10    349   +1151.7%    +3.30%     71%    +0.34
+    0.15    349   +1151.7%    +3.30%     71%    +0.34
+    0.20    349   +1151.7%    +3.30%     71%    +0.34
+    0.25    349   +1151.7%    +3.30%     71%    +0.34
+    0.30    348   +1151.0%    +3.31%     71%    +0.34
+    0.35    346   +1148.5%    +3.32%     71%    +0.34
+    0.40    291    +981.4%    +3.37%     70%    +0.33
+    0.45    291    +981.4%    +3.37%     70%    +0.33
+    0.50    246    +641.7%    +2.61%     70%    +0.45  ← best Sharpe
+    0.55    245    +642.5%    +2.62%     70%    +0.45
+    0.60    101    +230.6%    +2.28%     67%    +0.41
+    0.65     94    +190.5%    +2.03%     65%    +0.36
+    0.70     18      +4.6%    +0.26%     50%    +0.05
+    0.75      7      -5.0%    -0.72%     43%    -0.17
+    0.80      1      +1.3%    +1.30%    100%    +0.00
+    0.85      1      +1.3%    +1.30%    100%    +0.00  ← best avg/trade | ← best total P&L
+    0.90      0      +0.0%    +0.00%      0%    +0.00
+    0.95      0      +0.0%    +0.00%      0%    +0.00
+    1.00      0      +0.0%    +0.00%      0%    +0.00
+
+  [sonnet5]  (conf≥0.60 fixed)
+    mag≥      n    total%     avg%    win%   sharpe
+  ----------------------------------------------
+    0.00    165    +701.1%    +4.25%     70%    +0.34
+    0.05    165    +701.1%    +4.25%     70%    +0.34
+    0.10    165    +701.1%    +4.25%     70%    +0.34
+    0.15    165    +701.1%    +4.25%     70%    +0.34
+    0.20    165    +701.1%    +4.25%     70%    +0.34
+    0.25    165    +701.1%    +4.25%     70%    +0.34
+    0.30    165    +701.1%    +4.25%     70%    +0.34
+    0.35    165    +701.1%    +4.25%     70%    +0.34
+    0.40    158    +675.5%    +4.28%     70%    +0.34
+    0.45    136    +641.8%    +4.72%     71%    +0.35
+    0.50     94    +316.6%    +3.37%     66%    +0.49  ← best Sharpe
+    0.55     58    +149.7%    +2.58%     60%    +0.39
+    0.60     20     +34.8%    +1.74%     50%    +0.30  ← best avg/trade | ← best total P&L
+    0.65     10      +0.1%    +0.01%     40%    +0.00
+    0.70      2      -1.5%    -0.75%     50%    -0.28
+    0.75      2      -1.5%    -0.75%     50%    -0.28
+    0.80      1      -3.4%    -3.41%      0%    +0.00
+    0.85      0      +0.0%    +0.00%      0%    +0.00
+    0.90      0      +0.0%    +0.00%      0%    +0.00
+    0.95      0      +0.0%    +0.00%      0%    +0.00
+    1.00      0      +0.0%    +0.00%      0%    +0.00
+
+  ══ E) 2D SWEEP — optimal (magnitude, confidence) pair per model ══
+     Exhaustive grid search. Best cell per metric shown.
+
+  [haiku]  (minimum 10 trades per cell)
+    best avg/trade      mag≥0.20  conf≥0.75  n=158  avg=+3.66%  sharpe=+0.29
+    best total P&L      mag≥0.20  conf≥0.20  n=359  avg=+3.29%  sharpe=+0.34
+    best Sharpe         mag≥0.55  conf≥0.20  n=245  avg=+2.62%  sharpe=+0.45
+
+  [sonnet5]  (minimum 10 trades per cell)
+    best avg/trade      mag≥0.45  conf≥0.65  n=122  avg=+4.76%  sharpe=+0.34
+    best total P&L      mag≥0.20  conf≥0.20  n=330  avg=+3.44%  sharpe=+0.35
+    best Sharpe         mag≥0.20  conf≥0.75  n=55  avg=+4.44%  sharpe=+0.56

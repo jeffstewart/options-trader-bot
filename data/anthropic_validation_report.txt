@@ -1,0 +1,73 @@
+Loading universe…
+  1459 articles with Ollama scores + forward returns
+Loading Anthropic scores…
+  haiku: 1684 scored
+  sonnet5: 1682 scored
+
+Ollama baseline trades (mag≥0.75): 276
+
+  ══ F) BOOTSTRAP VALIDATION (n_boot=2000, 95% CI) ══
+     Tests whether sweep-optimal thresholds are stable or overfit.
+     Wide CI relative to point estimate → overfit / insufficient data.
+
+  Config                     n     avg%          95% CI avg   sharpe     95% CI sharpe    win%
+  ------------------------------------------------------------------------------------------
+  ollama                   276    +3.09%  [ +2.14%,  +4.40%]    +0.31  [+0.24, +0.53]     68%
+  haiku_current            291    +3.37%  [ +2.36%,  +4.73%]    +0.33  [+0.26, +0.51]     70%
+  haiku_best_avg           158    +3.66%  [ +2.08%,  +5.83%]    +0.29  [+0.23, +0.54]     68%
+  haiku_best_sharpe        245    +2.62%  [ +1.94%,  +3.35%]    +0.45  [+0.36, +0.54]     70%
+  s5_current               136    +4.72%  [ +2.88%,  +7.30%]    +0.35  [+0.28, +0.63]     71%
+  s5_best_avg              122    +4.76%  [ +2.70%,  +7.67%]    +0.34  [+0.26, +0.62]     69%
+  s5_best_sharpe            55    +4.44%  [ +2.40%,  +6.68%]    +0.56  [+0.33, +0.80]     69%
+
+  ══ G) JACKKNIFE STABILITY + TEMPORAL SPLIT ══
+     Jackknife SE: how much each single trade moves the avg.
+     Temporal split: does performance hold across time periods?
+
+  ollama  (n=276)
+    point avg:       +3.09%
+    jackknife SE:   +0.595%  (SE/avg = 19% — moderate)
+    jackknife bias: +0.000%
+    first half:      +3.14%  n=121
+    second half:     +3.04%  n=155
+    temporal:       ✅ consistent
+
+  haiku_current  (n=291)
+    point avg:       +3.37%
+    jackknife SE:   +0.606%  (SE/avg = 18% — moderate)
+    jackknife bias: +0.000%
+    first half:      +3.58%  n=121
+    second half:     +3.22%  n=170
+    temporal:       ✅ consistent
+
+  haiku_best_avg  (n=158)
+    point avg:       +3.66%
+    jackknife SE:   +0.990%  (SE/avg = 27% — moderate)
+    jackknife bias: +0.000%
+    first half:      +4.69%  n=66
+    second half:     +2.91%  n=92
+    temporal:       ✅ consistent
+
+  s5_current  (n=136)
+    point avg:       +4.72%
+    jackknife SE:   +1.155%  (SE/avg = 24% — moderate)
+    jackknife bias: +0.000%
+    first half:      +6.22%  n=56
+    second half:     +3.67%  n=80
+    temporal:       ⚠️  both positive but drift
+
+  s5_best_avg  (n=122)
+    point avg:       +4.76%
+    jackknife SE:   +1.278%  (SE/avg = 27% — moderate)
+    jackknife bias: +0.000%
+    first half:      +6.39%  n=52
+    second half:     +3.56%  n=70
+    temporal:       ⚠️  both positive but drift
+
+  s5_best_sharpe  (n=55)
+    point avg:       +4.44%
+    jackknife SE:   +1.074%  (SE/avg = 24% — moderate)
+    jackknife bias: +0.000%
+    first half:      +5.10%  n=27
+    second half:     +3.81%  n=28
+    temporal:       ✅ consistent
