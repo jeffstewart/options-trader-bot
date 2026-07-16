@@ -25,7 +25,8 @@ import confirm_veto_sweep as cvs
 # llama-3.1-8b DROPPED 2026-06-25 (Groq deprecating it); replaced by gpt-oss-20b (Groq's recommended
 # successor). Its prior scores stay cached but are no longer gathered/reported.
 # gpt-oss-120b ADDED 2026-06-24 with reasoning_effort=low → 100% clean parse @ ~565ms (validated).
-MODELS = [("llama-3.3-70b", "llama-3.3-70b-versatile", 3, None),                   # ~1k/day, low RPM
+# llama-3.3-70b DROPPED 2026-07-11 (Groq deprecating it; quota exhausted before gpt-oss could score).
+MODELS = [
           ("gpt-oss-20b",   "openai/gpt-oss-20b",      8, {"reasoning_effort": "low"}),  # 8b replacement
           ("gpt-oss-120b",  "openai/gpt-oss-120b",     8, {"reasoning_effort": "low"})]
           # gpt-oss limits: 30 RPM, 1k RPD, 8k TPM, 200k TPD · ~967 tok/req → TPM binds at ~8/min (8s
