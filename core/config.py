@@ -360,7 +360,12 @@ REGIME_MOMENTUM_DAYS  = 3
 # 2022 bear stayed positive (+$29/trade, never a net loss) while the 0.75–0.85 tier was flat. So
 # bullish signals at/above this magnitude trade even in a downtrend; the llama-4-scout confirm/veto
 # gate (downstream) still vets them. Set ≥ 1.01 to disable the bypass entirely.
-REGIME_BYPASS_MIN_MAGNITUDE = float(os.environ.get("REGIME_BYPASS_MIN_MAGNITUDE", "0.85"))
+# DISABLED 2026-07-16: live forward data contradicted the backtest — bypass trades went 1/13 (8% win,
+# −$2.0k) in the Jun–Jul chop while regime_block_shadow showed the blocked trades would have LOST
+# −$2.2k (the gate was right; the bypass was overriding it). Magnitude is uncalibrated (loser mag ≈
+# winner mag), so mag≥0.85 isn't the "market-independent alpha" marker the backtest made it look like.
+# Re-enable (env or lower default) only with fresh forward evidence.
+REGIME_BYPASS_MIN_MAGNITUDE = float(os.environ.get("REGIME_BYPASS_MIN_MAGNITUDE", "1.01"))
 
 # ── Backtest option-pricing model (Black-Scholes + IV crush) ──────────────────
 # The historical option tape is too sparse to price options directly, so the
