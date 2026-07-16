@@ -59,10 +59,10 @@ confirm/veto gate → legs. Gate live since 06-24: 472 decisions in `gemini_deci
 confirm). Gate latency stopgap `GATE_WAIT_TIMEOUT_SECS=20` still in place; "move gate to fast Groq
 production model" plan is now competing with "drop the gate entirely if sonnet5 goes primary".
 
-**⚠️ KNOWN LIVE ISSUE:** `GROQ_AB_MODELS` still defaults to deprecated `llama-3.3-70b-versatile` —
-the A/B shadow is 429-ing on EVERY article (visible in bot.log). Harmless to trading (off-trade-path)
-but it's dead quota noise: swap to a live production model (e.g. gpt-oss-20b won't work — no
-reasoning_effort param on that path — so likely just empty the list) on the next config touch+restart.
+**Live Groq A/B shadow — RETIRED 2026-07-16:** `GROQ_AB_MODELS` default emptied (was deprecated
+`llama-3.3-70b-versatile`, 429-ing on every article). The question it gathered data for is answered
+(backtest 100% coverage; both gpt-oss models lost to sonnet5). `scorer_ab.csv` stops growing;
+re-point via the `GROQ_AB_MODELS` env var if a live Groq A/B is ever needed again.
 
 **GROQ PRIMARY-SCORER BACKTEST — DONE (100% coverage, 2026-07-15):** llama-3.3-70b DROPPED (Groq
 deprecated it 07-11, quota died incomplete). Final matched-selectivity vs Ollama +3.09%: gpt-oss-20b

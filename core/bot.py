@@ -2913,7 +2913,7 @@ async def process_signal(headline: str, body: str, source: str,
     # Groq scorer A/B (shadow): score the same headline on Groq off the trade path and
     # log latency / agreement / rate-limit status. Fire-and-forget — never awaited here,
     # so it cannot delay the live (Ollama-driven) trade decision below.
-    if groq_client is not None:
+    if groq_client is not None and GROQ_AB_MODELS:
         asyncio.create_task(_groq_shadow_compare(headline, body, source, signal, score_ms))
 
     if not signal:

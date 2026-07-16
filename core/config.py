@@ -55,7 +55,12 @@ GROQ_AB_MODELS = [m.strip() for m in os.environ.get(
     # llama-4-scout dropped 2026-06-24 (Groq deprecating it). gpt-oss-120b NOT added here — it would
     # compete with the backtest for gpt-oss's tight daily quota (8K TPM / 200K TPD) and need the
     # reasoning_effort=low param the live path doesn't pass. The backtest covers gpt-oss instead.
-    "llama-3.3-70b-versatile").split(",") if m.strip()]
+    # EMPTIED 2026-07-16: llama-3.3-70b deprecated by Groq 07-11 — the shadow was 429-ing on every
+    # article (pure quota/log noise). The question this A/B gathered data for is ANSWERED: the
+    # backtest reached 100% coverage (matched-selectivity gpt-oss-20b +3.47% / 120b +3.60% vs Ollama
+    # +3.09%), and both lost to sonnet5 (+4.07%) — the cloud-primary decision moved to
+    # sonnet5-vs-gpt-oss. Re-point via env if a live Groq A/B is ever needed again.
+    "").split(",") if m.strip()]
 
 # ── Pre-score noise filter (2026-06-22) ────────────────────────────────────────────────
 # Drop high-confidence-NOISE articles BEFORE the ~3-8s scoring (saves Ollama compute + the Groq
