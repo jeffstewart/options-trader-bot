@@ -14,6 +14,7 @@ Usage:
 
 import asyncio
 import csv
+import html
 import json
 import logging
 import os
@@ -1380,21 +1381,32 @@ def _is_earnings_headline(headline: str) -> bool:
     h = (headline or "").lower()
     return any(p in h for p in _ROUTER_EARNINGS_PATTERNS)
 
+def _normalize_headline(text: str) -> str:
+    """Decode HTML entities + normalize curly quotes BEFORE filter matching. Feed headlines arrive
+    entity-encoded ("What&#39;s Going on With…") or with Unicode quotes ("What’s Going on With…"),
+    and both silently defeated every apostrophe-containing substring filter — the 07-02 AMD trade
+    (−$308) matched an EXISTING pattern that never fired. Double-unescape: some feeds double-encode
+    (&amp;#39;)."""
+    t = html.unescape(html.unescape(text or ""))
+    return (t.replace("’", "'").replace("‘", "'")
+             .replace("“", '"').replace("”", '"'))
+
 def _soft_catalyst_hit(headline: str, body: str):
     """Return the matched SOFT_CATALYST_PATTERN (analyst/PT, technical, acquirer-M&A) or None.
     These catalyst types are the bot's systematic losers (loser_analysis 2026-06-21) — the model
     over-scores them despite the prompt, so we gate them deterministically."""
-    text = f"{headline or ''} {body or ''}".lower()
+    text = _normalize_headline(f"{headline or ''} {body or ''}").lower()
     return next((p for p in SOFT_CATALYST_PATTERNS if p in text), None)
 
 def _prescore_noise(headline: str) -> "str | None":
     """Return the matched PRESCORE_SKIP_PATTERN (macro wrap / listicle / reactive recap) or None.
     Checked on the HEADLINE only, BEFORE scoring — these never warrant an Ollama/Groq call."""
-    h = (headline or "").lower()
+    hn = _normalize_headline(headline)
+    h = hn.lower()
     sub = next((p for p in PRESCORE_SKIP_PATTERNS if p in h), None)
     if sub:
         return sub
-    rx = next((r for r in PRESCORE_SKIP_REGEXES if r.search(headline or "")), None)
+    rx = next((r for r in PRESCORE_SKIP_REGEXES if r.search(hn)), None)
     return rx.pattern if rx else None
 
 def _router_reset_if_new_day():

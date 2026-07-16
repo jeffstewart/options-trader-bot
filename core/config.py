@@ -85,6 +85,18 @@ PRESCORE_SKIP_PATTERNS = (
     "to join the s&p", "joins the s&p", "joins s&p", "added to the s&p",
     "to join the russell", "joins the russell", "added to the russell", "added to russell",
     "to join the nasdaq", "join the nasdaq-100", "join the dow jones", "joins the dow jones",
+    # ── added 2026-07-16 (live trade review — matched against NORMALIZED text, see
+    #    bot._normalize_headline; validated on the Jun–Jul live window, gate-log r3 + trade P&L) ──
+    # gap variant of the existing "what's going on with" reactive recap
+    "what is going on with", "what's driving",
+    # returns-calculator recap variant the regexes below miss ("Here's How Much You Would Have
+    # Made Owning X Stock In The Last 5 Years")
+    "would have made owning",
+    # pundit/TV segment noise (opinion, not catalyst; reached the gate 16× in the live window)
+    "live on cnbc", "posts on x", "jim cramer", "dan ives",
+    # pre-event speculation: buying calls INTO an event = max IV for an unresolved coin-flip, and
+    # PEAD already owns the post-event trade. Live: NKE −$385, CVNA −$322, 0 winners.
+    "earnings preview", "in the spotlight ahead of", "earnings date",
 )
 
 # Regex skip patterns — for noise that needs more than a fixed substring. Benzinga's algorithmic
@@ -100,6 +112,25 @@ PRESCORE_SKIP_REGEXES = (
     re.compile(r"\$[\d,]+\s+invested\s+in\b", re.I),                        # "$100 Invested In X …" (bare $ → not $100M)
     re.compile(r"\d+\s+years?\s+ago\s+would\s+be\s+worth", re.I),           # "…10 Years Ago Would Be Worth…"
     re.compile(r"\boutperformed\b[^.]{0,40}\bover the (?:past|last)\s+\d+\s+(?:year|month)", re.I),
+    # ── added 2026-07-16 (live trade review; matched on NORMALIZED headlines) ──
+    # intraday-listicle: "12 Health Care Stocks Moving In Tuesday's Intraday Session" — the most
+    # toxic family found live (n=18 gated signals, avg r3 −15.0%, win 28% — micro-caps already done
+    # mean-reverting). Nothing blocked it before.
+    re.compile(r"\b\d+\s[\w\s-]{0,30}stocks moving in \w+day", re.I),
+    # reactive already-moved recap questions ("Why Is X Stock Surging Wednesday?", "Boeing Stock
+    # Surges On Thursday: Here's Why", "Sandisk Stock Rallies Tuesday: What's Happening?") — live
+    # n=28 gated signals avg r3 −6.1% win 36%; blocked 12 real trades net −$1,983 (2 winners lost).
+    # NOTE: bull-tape positive (+5.2%) — this family is regime-dependent momentum-chasing; the
+    # "trading is late" mechanism + live chop evidence say drop it. Plain "X shares are trading
+    # higher after <catalyst>" attribution headlines do NOT match (kept — NVO winner was that form).
+    re.compile(r"why is .{0,40}(stock|shares).{0,20}(surg|gain|jump|ris|soar|climb|trend|mov)", re.I),
+    re.compile(r"(stock|shares)\s+(is |are )?(surg\w+|rall\w+|climb\w+|soar\w+|jump\w+|trending higher|gaining).{0,30}(what|here's why|why)", re.I),
+    # acquirer-side speculative deal talk ("QCOM in discussions to buy Tenstorrent" −$378,
+    # "Microsoft weighs DeepSeek" −$480; 3 live trades, −$1,063, 0 winners). Speculative-talks
+    # extension of the validated acquirer-M&A soft-catalyst category. Target-side/resolved M&A
+    # ("X agrees to takeover offer", "X attracts interest") intentionally NOT matched.
+    re.compile(r"\bin (talks|discussions) to (buy|acquire)\b", re.I),
+    re.compile(r"\bweighs\b", re.I),
 )
 
 # ── Stale-news drop (2026-06-22) ───────────────────────────────────────────────────────

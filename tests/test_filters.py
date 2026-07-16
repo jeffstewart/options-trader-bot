@@ -29,7 +29,50 @@ REAL_CATALYSTS = [
     "Broadcom Unveils Jalapeño AI Inference Chip",
     "Qualcomm To Exit FY26 At $6B In Automotive Revenue",
     "Pfizer's Drug Gets FDA Approval For New Indication",
+    # reactive-LOOKING but carries a real catalyst attribution — must NOT be dropped (the NVO
+    # winner +$225 was exactly this form)
+    "Novo Nordisk shares are trading higher after the European Commission approved its once-daily Wegovy pill.",
+    # resolved target-side M&A — must NOT be caught by the acquirer-speculation patterns
+    "EasyJet Agrees to Castlelake's £5.2 Billion Takeover Offer",
+    "Rivian Beat Q2 Delivery Estimates And Raised Its Full-Year Delivery Outlook",
 ]
+
+# ── 2026-07-16: HTML entities / curly quotes silently defeated existing patterns (live AMD −$308,
+#    NU curly-apostrophe variant). _normalize_headline must decode before matching. ────────────────
+ENTITY_ENCODED_NOISE = [
+    "What&#39;s Going on With AMD Stock Thursday?",                 # HTML-entity apostrophe
+    "What’s Going on With Nu Holding Shares on Monday?",            # Unicode curly apostrophe
+    "Here&#39;s How Much $1000 Invested In Home Depot 20 Years Ago Would Be Worth Today",
+    "Here’s How Much You Would Have Made Owning Apple Stock In The Last 5 Years",
+]
+
+# ── 2026-07-16 live-trade-review families (evidence in config.py comments) ─────────────────────────
+NEW_NOISE = [
+    "12 Health Care Stocks Moving In Tuesday's Intraday Session",   # intraday listicle, avg r3 −15%
+    "Why Is Carvana Stock Surging Wednesday?",                      # reactive recap question
+    "Why Is Vera Therapeutics Stock Gaining Tuesday?",
+    "Boeing Stock Surges On Thursday: Here's Why",                  # reactive recap suffix form
+    "Sandisk Stock Rallies Tuesday: What's Happening?",
+    "Oracle Stock Is Climbing Today: What's Going On?",
+    "What Is Going On With Intel Stock On Thursday?",               # "what is" gap variant
+    "Ouster Stock Is Surging Monday: What&#39;s Driving The Action?",
+    "Nike In The Spotlight Ahead Of Q4 Earnings",                   # pre-event speculation
+    "Carvana Stock Jumps On Q2 Earnings Date Announcement",
+    "Qualcomm In Discussions To Buy Tenstorrent For $8-$10 Billion",  # acquirer-side deal talk
+    "Microsoft Weighs DeepSeek For Copilot Cowork",
+    "Live On CNBC, Josh Brown Hosts Segment Titled \"Josh's Best Stock Spotlight\"",  # pundit/TV
+    "From Nvidia's 'Godfather of AI' to Palantir's 'Messi of AI': Dan Ives' Stock Calls",
+]
+
+
+@pytest.mark.parametrize("headline", ENTITY_ENCODED_NOISE)
+def test_prescore_drops_entity_encoded_noise(headline):
+    assert bot._prescore_noise(headline) is not None, f"entity/curly-quote form must be dropped: {headline!r}"
+
+
+@pytest.mark.parametrize("headline", NEW_NOISE)
+def test_prescore_drops_live_review_families(headline):
+    assert bot._prescore_noise(headline) is not None, f"should drop (2026-07 live review): {headline!r}"
 
 
 @pytest.mark.parametrize("headline", INDEX_INCLUSION)
