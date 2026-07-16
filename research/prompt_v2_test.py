@@ -57,6 +57,140 @@ resolved: true ONLY if the event has ALREADY HAPPENED and removed uncertainty �
   price targets, predictions."""
 
 
+# ── Ticker-only DEPLOYMENT variant (TICKER_ONLY=1) ────────────────────────────────────────────────
+# The 85% result above came from the 4-field prompt; the live post-score check would ask ONLY the
+# ticker question (dead fields dropped, "losing side" made explicit — the BEAM arbitration case).
+# Scored under separate cache keys ("v2t:") so both variants coexist for comparison.
+V2T_PROMPT = """You are a financial news analyst. Respond with a JSON object ONLY — no markdown, no explanation.
+
+Schema:
+{ "ticker": "<one symbol from CANDIDATES, or NONE>" }
+
+ticker: the ONE symbol from CANDIDATES whose company is the PRIMARY SUBJECT of this news AND the
+party that most directly benefits or suffers from it. A company that is merely mentioned, or that
+is on the LOSING side of the event (lost the lawsuit, is being outcompeted, is the acquirer paying
+a premium), is NOT the answer. If the news is not mainly about any candidate, answer "NONE".
+Never output a symbol that is not in CANDIDATES."""
+
+
+def score_v2t(cli, art):
+    t0 = time.time()
+    raw = cli.chat.completions.create(
+        model=MODEL, temperature=0.1, max_tokens=60,
+        messages=[{"role": "system", "content": V2T_PROMPT},
+                  {"role": "user", "content": f"Headline: {art['h']}\n\nBody: {art['body']}\n\n"
+                                              f"CANDIDATES: {art['syms']}\n\nRespond with JSON only."}],
+    ).choices[0].message.content.strip()
+    lat = time.time() - t0
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return None, lat
+    try:
+        o = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None, lat
+    tk = o.get("ticker")
+    tk = tk.strip().upper() if isinstance(tk, str) else "NONE"
+    if tk != "NONE" and tk not in art["syms"]:
+        tk = f"INVALID:{tk}"
+    return {"tk": tk}, lat
+
+
+def report_ticker_only(set_a, sc):
+    print("\n══ TICKER-ONLY deployment prompt vs 4-field tested prompt (set A hard cases) ══")
+    rows = [(a, sc.get(f"v2t:{a['ck']}"), sc.get(f"v2:{a['ck']}")) for a in set_a]
+    rows = [(a, t, f) for a, t, f in rows if t]
+    agree_t = sum(1 for a, t, f in rows if t["tk"] == a["s5_tk"])
+    agree_f = sum(1 for a, t, f in rows if f and f["tk"] == a["s5_tk"])
+    none_t = sum(1 for a, t, f in rows if t["tk"] == "NONE")
+    inval_t = sum(1 for a, t, f in rows if str(t["tk"]).startswith("INVALID"))
+    print(f"  n={len(rows)}")
+    print(f"  ticker-only matches sonnet5: {agree_t}/{len(rows)} ({agree_t/len(rows)*100:.0f}%)")
+    print(f"  4-field   matches sonnet5:   {agree_f}/{len(rows)} ({agree_f/len(rows)*100:.0f}%)")
+    print(f"  ticker-only NONE: {none_t} · invalid: {inval_t}")
+    flips_bad = [(a, t, f) for a, t, f in rows if f and f["tk"] == a["s5_tk"] and t["tk"] != a["s5_tk"]]
+    flips_good = [(a, t, f) for a, t, f in rows if f and f["tk"] != a["s5_tk"] and t["tk"] == a["s5_tk"]]
+    print(f"  flips: 4-field-right→ticker-only-wrong {len(flips_bad)} · wrong→right {len(flips_good)}")
+    for a, t, f in flips_bad[:6]:
+        print(f"    lost:  v2t={str(t['tk']):10} s5={a['s5_tk']:6} {a['h'][:60]}")
+    lats = [v for k, v in sc.items() if k.startswith("latt:")]
+    if lats:
+        print(f"  latency: avg {statistics.mean(lats):.1f}s  p50 {statistics.median(lats):.1f}s")
+
+
+def load_full_sets():
+    """FULL_TEST sets: every article with feed candidates + a sonnet5 reference.
+    easy  = v1-Ollama already agreed with sonnet5 (selection must not BREAK these)
+    hard  = outright disagreement (set A superset — includes s5-pick-not-in-candidates)
+    none  = sonnet5 emitted NO ticker (selection must answer NONE, not force-pick)"""
+    dual = json.load(open("dual_score_cache.json"))
+    anth = json.load(open("anthropic_backtest_cache.json"))
+    easy, hard, none_set = [], [], []
+    for k, v in anth.items():
+        if not k.startswith("sonnet5:") or not v:
+            continue
+        ck = k.split(":", 1)[1]
+        dv = dual.get(ck)
+        if not isinstance(dv, dict):
+            continue
+        a = dv.get("_article", {}) or {}
+        b = dv.get("bullish", {}) or {}
+        h = (a.get("headline") or "").strip()
+        try:
+            syms = ast.literal_eval(a.get("symbols")) if isinstance(a.get("symbols"), str) else (a.get("symbols") or [])
+        except Exception:
+            syms = []
+        syms = [s for s in syms if isinstance(s, str) and s.isupper() and 1 <= len(s) <= 5]
+        if not h or not syms:
+            continue
+        o_tks = [t for t in (b.get("tickers") or []) if t not in ("BTC", "ETH")]
+        s5_ticks = [t for t in (v.get("tick") or []) if isinstance(t, str)]
+        art = {"ck": ck, "h": h, "body": (a.get("summary") or "")[:1200], "syms": syms[:8],
+               "o_tk": o_tks[0] if o_tks else None, "s5_tk": s5_ticks[0] if s5_ticks else None}
+        if not s5_ticks:
+            none_set.append(art)
+        elif art["s5_tk"] not in art["syms"]:
+            continue                        # no in-candidates reference → unmeasurable, skip
+        elif o_tks and o_tks[0] == art["s5_tk"]:
+            easy.append(art)
+        else:
+            hard.append(art)
+    rng = random.Random(SEED)
+    none_sample = rng.sample(none_set, min(250, len(none_set)))
+    return easy, hard, none_sample
+
+
+def report_full(easy, hard, none_sample, sc):
+    print("\n══ FULL TEST — ticker-only deployment prompt vs sonnet5 reference ══")
+    for name, arts in (("EASY (v1 already right)", easy), ("HARD (v1 wrong)", hard)):
+        rows = [(a, sc.get(f"v2t:{a['ck']}")) for a in arts]
+        rows = [(a, t) for a, t in rows if t]
+        if not rows:
+            print(f"  {name}: n=0")
+            continue
+        agree = sum(1 for a, t in rows if t["tk"] == a["s5_tk"])
+        none_r = sum(1 for a, t in rows if t["tk"] == "NONE")
+        print(f"  {name:24} n={len(rows):<4} matches sonnet5 {agree}/{len(rows)} ({agree/len(rows)*100:.0f}%)  NONE={none_r}")
+        misses = [(a, t) for a, t in rows if t["tk"] != a["s5_tk"] and t["tk"] != "NONE"][:5]
+        for a, t in misses:
+            print(f"      miss: v2t={str(t['tk']):8} s5={a['s5_tk']:6} v1={str(a['o_tk']):6} {a['h'][:58]}")
+    rows = [(a, sc.get(f"v2t:{a['ck']}")) for a in none_sample]
+    rows = [(a, t) for a, t in rows if t]
+    if rows:
+        none_r = sum(1 for a, t in rows if t["tk"] == "NONE")
+        print(f"  {'NO-TICKER (s5 said none)':24} n={len(rows):<4} v2t answered NONE {none_r}/{len(rows)} ({none_r/len(rows)*100:.0f}%)")
+        forced = [(a, t) for a, t in rows if t["tk"] != "NONE"][:6]
+        for a, t in forced:
+            print(f"      force-picked: v2t={str(t['tk']):8} {a['h'][:64]}")
+    lats = [v for k, v in sc.items() if k.startswith("latt:")]
+    if lats:
+        print(f"  latency: avg {statistics.mean(lats):.1f}s  p50 {statistics.median(lats):.1f}s")
+
+
 def load_sample():
     dual = json.load(open("dual_score_cache.json"))
     anth = json.load(open("anthropic_backtest_cache.json"))
@@ -183,6 +317,48 @@ def main():
     set_a, set_b = load_sample()
     print(f"set A (ticker hard cases): {len(set_a)} · set B (random w/ r3): {len(set_b)}")
     sc = json.load(open(CACHE)) if os.path.exists(CACHE) else {}
+
+    if os.environ.get("FULL_TEST") == "1":
+        easy, hard, none_sample = load_full_sets()
+        print(f"FULL TEST — easy: {len(easy)} · hard: {len(hard)} · no-ticker sample: {len(none_sample)}")
+        if os.environ.get("REPORT_ONLY") != "1":
+            cli = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+            todo = [a for a in easy + hard + none_sample if f"v2t:{a['ck']}" not in sc]
+            print(f"to score: {len(todo)}")
+            for i, art in enumerate(todo):
+                try:
+                    res, lat = score_v2t(cli, art)
+                except Exception as e:
+                    print(f"  [{i+1}] error: {e}", flush=True)
+                    continue
+                sc[f"v2t:{art['ck']}"] = res
+                sc[f"latt:{art['ck']}"] = round(lat, 2)
+                if (i + 1) % 50 == 0:
+                    json.dump(sc, open(CACHE, "w"))
+                    print(f"  {i+1}/{len(todo)}", flush=True)
+            json.dump(sc, open(CACHE, "w"))
+        report_full(easy, hard, none_sample, sc)
+        return
+
+    if os.environ.get("TICKER_ONLY") == "1":
+        if os.environ.get("REPORT_ONLY") != "1":
+            cli = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+            todo = [a for a in set_a if f"v2t:{a['ck']}" not in sc]
+            print(f"ticker-only variant — to score: {len(todo)}")
+            for i, art in enumerate(todo):
+                try:
+                    res, lat = score_v2t(cli, art)
+                except Exception as e:
+                    print(f"  [{i+1}] error: {e}", flush=True)
+                    continue
+                sc[f"v2t:{art['ck']}"] = res
+                sc[f"latt:{art['ck']}"] = round(lat, 2)
+                if (i + 1) % 25 == 0:
+                    json.dump(sc, open(CACHE, "w"))
+                    print(f"  {i+1}/{len(todo)}", flush=True)
+            json.dump(sc, open(CACHE, "w"))
+        report_ticker_only(set_a, sc)
+        return
 
     if os.environ.get("REPORT_ONLY") != "1":
         cli = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
