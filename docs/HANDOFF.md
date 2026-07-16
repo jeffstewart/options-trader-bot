@@ -2,13 +2,73 @@
 
 **Purpose of this file:** a self-contained context dump so another Claude
 session (Cowork or otherwise) with file access to this Mac can pick up the work
-without the prior conversation. Last updated **2026-06-23** (live-state block at top; sections below are 2026-06-01 history).
+without the prior conversation. Last updated **2026-07-16** (live-state block at top; sections below are 2026-06-01 history).
 
 Working directory: `/Users/jeff/Claude/Trader`
 
 ---
 
-## ⚠️ CURRENT LIVE STATE (2026-06-24) — read this first; everything below is from 2026-06-01 and is STALE
+## ⚠️ CURRENT LIVE STATE (2026-07-16) — read this first; everything below is from 2026-06-01 and is STALE
+
+**📉 LIVE P&L REALITY CHECK (trade-level review 2026-07-16, of the unattended 2026-06-09→07-16 run):**
+realized **−$16,801 over 165 closed trades, 25% win, negative EVERY week** (paper equity $83.2k).
+news_call −$11.4k (17% win) + lotto −$4.1k = 92% of the loss; stock/pairs/pead ≈ flat. **Root cause =
+the OPTIONS WRAPPER, not the signal**: same signals as stock ran median −1.2%/trade vs options median
+−35.6%. Decomposition (all from live data): (1) ~10.6% median round-trip spread tax (buy ask, exit
+bid; entry=peak=ask while the monitor marks mid); (2) overnight IV crush — ~80% of option trades die
+<24h ("buy midday on news, stopped next morning"; NKE stock +4.1% yet its call −67%, MSFT −1.9% →
+−73%); (3) genuine post-news reversals (ACN −91%). **Exit engineering is a DEAD END on this data**
+(contradicts the June TP@+25% backtest at the P&L level): from real position_paths.csv, TP@+25% saves
+only ~$350 of a $6.5k hole (24/38 losers never reached +10%) and even PERFECT sell-at-peak ≈ +$5.2k
+ceiling. `news_call_options_test.py`: NO delta×DTE geometry flips the news population median-positive
+(unlike PEAD, where Δ0.70/45d works — that forward shadow continues). Shadow book agrees:
+news_call_shadow's "+$13.4k" is a mirage (top-5 = one Jun-12-15 semi cluster incl. a pre-budget-guard
+$14k-notional SNDK artifact = 133% of it; ex-top-5 **−$4.4k/106**), stock_shadow ≈ flat (−$5/trade).
+Jeff's decision: market conditions (Iran-war chop: SPY +1.8% but 14/26 sessions down) — do NOT
+overhaul the strategy; fix the GATE instead (below) and keep collecting.
+
+**🔑 REGIME GATE (reworked 2026-07-16, deployed + bot restarted):** `market_in_uptrend()` now requires
+**200d SMA AND 3d momentum AND a CHOP BRAKE — down-day density <60% over the last 10 SPY sessions**
+(`REGIME_DOWNDAY_WINDOW=10`/`REGIME_DOWNDAY_MAX_DENSITY=0.60`, env-overridable, 0=off). Evidence:
+`regime_gate_chop_sweep.py` on 3 tapes (bull-meltup / 2022-bear / live-chop from regime_decisions.csv)
+— keeps 98% of bull P&L at best-tested Sharpe (2.65→2.91), full bear block, flips live-chop −$10.9k →
++$3.9k (skip 73%). ⚠ dd threshold is KNIFE-EDGED on the one 4-week chop sample (65% never fires, 50%
+blocks all) — `regime_block_shadow` tracks blocks; check its forward P&L in a few weeks. ER (Kaufman)
+is the graceful-dial fallback if 60% proves overfit. A self-referential "heat" gate FAILED (lags chop;
+standalone in bear it's worse than no gate). **REGIME BYPASS DISABLED** (mag≥0.85-in-downtrend,
+`REGIME_BYPASS_MIN_MAGNITUDE` 0.85→1.01): live it went 1/13 (8% win, −$2.0k) while regime_block_shadow
+showed the blocked trades would ALSO have lost (−$2.2k) — the gate was right, the bypass overrode it.
+
+**🔑 SONNET5 / ANTHROPIC PRIMARY-SCORER (2026-07-13/16, jeff bought API credits) — swap is an open TODO:**
+`anthropic_scorer.py` scored the backtest universe with haiku + sonnet5 (~1,683 each; sonnet-4-6/opus
+only sampled); `anthropic_backtest.py` = P&L + sweeps + bootstrap/jackknife (reports in data/*.txt).
+**sonnet5 is the best primary scorer tested**: matched-selectivity +4.07%/trade vs Ollama +3.09%
+(n=176); at bot thresholds (mag≥0.45, conf≥0.60) +4.72%/trade, boot CI [+2.88,+7.30] — but smallest-n
+and jackknife shows temporal drift (+6.22% → +3.67%, both halves positive). Cost ≈ **$1.57/month** at
+41 articles/day with prompt caching (intro pricing through Aug 2026). **BUT sonnet5 is an INVERTED
+confirm/veto gate** (`anthropic_gate_bakeoff.py`: edge −1.1% at the live bar — good picker ≠ good
+gate), **and the live mistral gate hurts sonnet5's book** (`sonnet5_mistral_pipeline.py`, full 136-pick
+coverage after `score_sonnet5_gap_mistral.py`): mistral confirms 82%, but its vetoes had an 80% WIN
+rate → gate costs ~14% of total P&L by cutting winners. If sonnet5 goes primary: run UNGATED (also
+removes the ~20s gate-latency drag) or re-tune the gate for sonnet5's candidate mix. Deferred pending
+jeff's go-ahead (real per-call cost).
+
+**Scoring flow (live, unchanged engine):** Ollama (`llama3.2`, unified_v1) scores every article →
+pre-score noise+soft-catalyst filters → regime gate (3 conditions above; NO bypass) → mistral-large
+confirm/veto gate → legs. Gate live since 06-24: 472 decisions in `gemini_decisions.csv` (~84%
+confirm). Gate latency stopgap `GATE_WAIT_TIMEOUT_SECS=20` still in place; "move gate to fast Groq
+production model" plan is now competing with "drop the gate entirely if sonnet5 goes primary".
+
+**⚠️ KNOWN LIVE ISSUE:** `GROQ_AB_MODELS` still defaults to deprecated `llama-3.3-70b-versatile` —
+the A/B shadow is 429-ing on EVERY article (visible in bot.log). Harmless to trading (off-trade-path)
+but it's dead quota noise: swap to a live production model (e.g. gpt-oss-20b won't work — no
+reasoning_effort param on that path — so likely just empty the list) on the next config touch+restart.
+
+**GROQ PRIMARY-SCORER BACKTEST — DONE (100% coverage, 2026-07-15):** llama-3.3-70b DROPPED (Groq
+deprecated it 07-11, quota died incomplete). Final matched-selectivity vs Ollama +3.09%: gpt-oss-20b
++3.47%, gpt-oss-120b +3.60% (n=249-276) — both edge Ollama but BOTH BEATEN by sonnet5 (+4.07%). The
+cloud-primary decision is now sonnet5-vs-gpt-oss, not Groq-vs-Ollama. `resume_after_reset.py` got a
+cache-read retry (write-race fix); the backtest daemon is done/down — no need to restart it.
 
 **🗂 RESTRUCTURED 2026-06-24 — the project is now a git repo with an organized layout (was flat):**
 - `core/` runtime+engine (bot.py, config.py, dashboard.py, backtest.py, pricing.py, yahoo_data.py, router_eval.py, spawn_daemon.py) · `research/` ~112 backtest/analysis scripts · `tests/` pytest suite · `docs/` (this file) · `data/` caches+CSVs+`bot_state.json` (gitignored) · `logs/` (gitignored).
@@ -16,24 +76,22 @@ Working directory: `/Users/jeff/Claude/Trader`
 - **Manage daemons with `./manage.sh {start|sched|stop|restart-bot|status|test}`** (wraps the now-verbose absolute-path launch commands). pids in `data/*.pid`, logs in `logs/`.
 - **git:** `main` branch; code+docs tracked, `.env`/data/logs/caches gitignored. Commit going forward.
 
-**Running:** bot, dashboard, `resume_after_reset.py` (backtest scheduler), and the backtest are daemons (ppid 1) via `core/spawn_daemon.py`. Restart the bot: `./manage.sh restart-bot`. Process match is still `pgrep -f 'core/bot.py'` (or `bot.py`). Log timestamps are LOCAL PDT, not UTC. Run tests: `./manage.sh test` (or `.venv/bin/python -m pytest`).
+**Running:** bot, dashboard, and `resume_after_reset.py` (backtest scheduler) are daemons (ppid 1) via `core/spawn_daemon.py`; the groq backtest daemon is DONE/down (100% coverage) — no need to restart it. Watchdog cron + unattended hardening: `docs/UNATTENDED.md`. Restart the bot: `./manage.sh restart-bot`. Process match is still `pgrep -f 'core/bot.py'` (or `bot.py`). Log timestamps are LOCAL PDT, not UTC. Run tests: `./manage.sh test` (or `.venv/bin/python -m pytest`).
 
-**Scoring flow:** Ollama (`llama3.2`, local, unified_v1 prompt = `SYSTEM_PROMPT`) scores every article. Bullish + passes signal_checks → **(1) pre-score noise + soft-catalyst filters** (drop analyst/PT, technical, acquirer-M&A, AND index-inclusion/reconstitution headlines PRE-score) → **(2) regime gate** (SPY≥200d SMA AND ≥3d-ago momentum) — long-beta paused in downtrend, EXCEPT high-conviction bypass below → **(3) confirm/veto gate** → legs. Index-inclusion filter added 2026-06-24 (`PRESCORE_SKIP_PATTERNS`): backtested on past rebalance windows via Alpaca historical news (`index_event_backtest.py`) — added stocks show NO directional edge (3-day fwd avg +0.1%, ~50% positive) yet over-score to 0.85 → tripped the regime bypass (GOOG/DJIA −36% live). Russell/S&P/Dow reconstitution is a quarterly burst the bot's own caches miss.
+**Pre-score filters (detail):** index-inclusion filter added 2026-06-24 (`PRESCORE_SKIP_PATTERNS`): backtested on past rebalance windows via Alpaca historical news (`index_event_backtest.py`) — added stocks show NO directional edge (3-day fwd avg +0.1%, ~50% positive) yet over-score to 0.85 → tripped the (now-removed) regime bypass (GOOG/DJIA −36% live). Russell/S&P/Dow reconstitution is a quarterly burst the bot's own caches miss. Also drops analyst/PT, technical, acquirer-M&A soft catalysts and Benzinga returns-calculator recaps pre-score.
 
-**🔑 CONFIRM/VETO GATE — now `mistral-large` (switched 2026-06-24).** History: Gemini → Groq `llama-4-scout` (06-23) → **mistral-large (06-24)** because Groq is DEPRECATING llama-4-scout. From the n=345 bake-off (`overnight_confirm_veto.py`, real news_call option P&L): scout was #1 (+5.2%, SIG) but is gone; **mistral-large was the validated #2 — edge +4.7%, boot CI [+0.5,+10.7], SIG** — and it's on MISTRAL (not Groq), so immune to Groq model churn. ~2.7s latency (fine at ~10-30 gate calls/day). Reasoning models (gpt-oss-120b, qwen3.6) were NOT viable as the gate (collapsed/parse-failed at scale; the parse part is fixable — see A/B below — but rate-limits remain). **Config (config.py): the `GEMINI_*` names now WIRE TO MISTRAL** (`GEMINI_BASE_URL/KEY`=`MISTRAL_BASE_URL`/`MISTRAL_API_KEY`, `GEMINI_MODEL`=`mistral-large-latest`, `GATE_DAILY_CAP=1000`, `GATE_LATCH_ON_RATELIMIT=0`). `GATE_LABEL="mistral-large"` in logs. Internal scorer TAGS stay `"gemini"`/`"gemini_veto"` for analytics continuity. Override any of these with `CONFIRM_GATE_*` env vars. **Gate had not fired live as of 06-23** (no `gemini_decisions.csv` yet — regime blocked longs until the bypass); watch for first firings.
+**🔑 CONFIRM/VETO GATE — now `mistral-large` (switched 2026-06-24).** History: Gemini → Groq `llama-4-scout` (06-23) → **mistral-large (06-24)** because Groq is DEPRECATING llama-4-scout. From the n=345 bake-off (`overnight_confirm_veto.py`, real news_call option P&L): scout was #1 (+5.2%, SIG) but is gone; **mistral-large was the validated #2 — edge +4.7%, boot CI [+0.5,+10.7], SIG** — and it's on MISTRAL (not Groq), so immune to Groq model churn. ~2.7s latency (fine at ~10-30 gate calls/day). Reasoning models (gpt-oss-120b, qwen3.6) were NOT viable as the gate (collapsed/parse-failed at scale; the parse part is fixable — see A/B below — but rate-limits remain). **Config (config.py): the `GEMINI_*` names now WIRE TO MISTRAL** (`GEMINI_BASE_URL/KEY`=`MISTRAL_BASE_URL`/`MISTRAL_API_KEY`, `GEMINI_MODEL`=`mistral-large-latest`, `GATE_DAILY_CAP=1000`, `GATE_LATCH_ON_RATELIMIT=0`). `GATE_LABEL="mistral-large"` in logs. Internal scorer TAGS stay `"gemini"`/`"gemini_veto"` for analytics continuity. Override any of these with `CONFIRM_GATE_*` env vars. Gate has been live since 06-24 — 472 decisions in `gemini_decisions.csv` (~84% confirm rate). ⚠️ For sonnet5-as-primary the gate is a NET NEGATIVE at current tuning (see the sonnet5 block at top).
 
-**🔑 REGIME BYPASS (2026-06-23):** `REGIME_BYPASS_MIN_MAGNITUDE=0.85` — bullish catalysts at/above this magnitude trade EVEN IN A DOWNTREND (then still face the gate). Backtest (`regime_bypass_option_pnl.py`, real option P&L): down-regime ≥0.85 calls made money — recent pullbacks +$274/trade, even the 2022 BEAR stayed positive (+$29/trade, never a net loss). The blunt regime filter was blocking strong idiosyncratic catalysts (e.g. SCWX relisting). Set ≥1.01 to disable.
+**🔑 REGIME BYPASS — DISABLED 2026-07-16** (see the regime-gate block at top for the live evidence that killed it). Historical context: deployed 2026-06-23 on `regime_bypass_option_pnl.py` backtest evidence (down-regime mag≥0.85 calls +$274/trade in pullbacks, positive even in the 2022 bear). The live forward test falsified it — a reminder that magnitude is uncalibrated (loser mag ≈ winner mag), so a magnitude bar can't identify "market-independent" alpha.
 
-**🔑 GROQ PRIMARY-SCORER investigation (for a CLOUD move where local Ollama isn't practical → run Groq as primary):**
-- **LIVE A/B** (shadow, in bot.py): scores every article with `GROQ_AB_MODELS` + Ollama → `scorer_ab.csv` (logs `groq_model` + tickers, for forward-P&L via `groq_vs_ollama_pnl.py`). ⚠️ `GROQ_AB_MODELS` still = [llama-3.3-70b, **llama-4-scout**] — scout is deprecating, so this should be updated (drop scout / add gpt-oss-120b) on the next bot restart. Old ticker-less log archived `scorer_ab_pre_ticker_20260623.csv` (prior: 79% sentiment agree, Groq 5.6× faster but more conservative; can't be PRIMARY on free tier — 53% rate-limited).
-- **BACKTEST (faster, no waiting):** `groq_vs_ollama_backtest.py` scores the full ~1,906-article universe (incl. Ollama-neutral, so "Groq-only" trades are measurable) with each Groq model, vs Ollama AS PRIMARY. `resume_after_reset.py` is a daemon that resumes it after each Groq daily-cap reset (00:10 UTC) until the gated models finish; circuit-breaker stops a model cleanly at its rate wall (no None-flooding). Section A = fixed mag≥0.75 (shows Groq's lower mag scale), Section B = MATCHED selectivity (the fair pick-quality test). `REPORT_ONLY=1` reads partials anytime.
-- **FINDINGS so far:** scout (now deprecated) slightly BEAT Ollama (matched +3.0% vs +2.7%) — moot. **llama-3.1-8b is WORSE than Ollama** (+1.9% vs +2.7% — weaker picker, ruled out). 70b inconclusive (can't finish on free tier). **gpt-oss-120b ADDED 2026-06-24** as the remaining candidate.
-- **Reasoning-model fix (validated 2026-06-24):** gpt-oss-120b & qwen3.6's earlier "failures" were mostly RATE-LIMITS, not parse. With `reasoning_effort=low`, **gpt-oss-120b = 100% clean parse @ ~565ms** (viable; now in the backtest via the new `extra` param on `confirm_veto_sweep.score_one`). qwen3.6 parses with `max_tokens=4000` but is ~13s/call → too slow, left out. `/no_think` is ignored by qwen.
-- **CONSTRAINT:** no paid Groq plan available (couldn't open one), so all backtest scoring is free-tier rate-limited (multi-day grind via the scheduler). scout/8b/gpt-oss daily-capped ~1k/day; only the 8b-class (14.4k/day) finishes in ~1 day but it's TPM=6000-throttled to ~7/min.
+**🔑 GROQ PRIMARY-SCORER investigation — CONCLUDED (see DONE block at top for final numbers). Kept for context:**
+- **LIVE A/B** (shadow, in bot.py): scores every article with `GROQ_AB_MODELS` + Ollama → `scorer_ab.csv` (logs `groq_model` + tickers, for forward-P&L via `groq_vs_ollama_pnl.py`). ⚠️ now 429-ing on every article — see KNOWN LIVE ISSUE at top. Old ticker-less log archived `scorer_ab_pre_ticker_20260623.csv` (prior: 79% sentiment agree, Groq 5.6× faster but more conservative; can't be PRIMARY on free tier — 53% rate-limited).
+- **BACKTEST:** `groq_vs_ollama_backtest.py` scored the full universe (incl. Ollama-neutral, so "Groq-only" trades are measurable) with each Groq model, vs Ollama AS PRIMARY. Section A = fixed mag≥0.75 (shows Groq's ~3-5× lower mag scale), Section B = MATCHED selectivity (the fair pick-quality test). `REPORT_ONLY=1` re-reads anytime. Model churn absorbed along the way: llama-4-scout (preview, deprecated 06-24), llama-3.1-8b (→gpt-oss-20b, 06-25), llama-3.3-70b (07-11). **Rule: pin live+backtest scoring to Groq PRODUCTION-tier models only.**
+- **Reasoning-model fix (validated 2026-06-24):** with `reasoning_effort=low`, gpt-oss-120b = 100% clean parse @ ~565ms (via the `extra` param on `confirm_veto_sweep.score_one`). qwen3.6 parses with `max_tokens=4000` but ~13s/call → too slow.
 
 **Sizing:** FLAT (`MAGNITUDE_SIZING_ENABLED=False`, `NONMAG_SIZE_FRAC=0.65`×$1000) — magnitude uncalibrated (below), no magnitude-scaling.
 
-**Live legs:** REAL = news_call (mag≥0.75), lotto (mag≥0.70&conf≥0.85), pead (earnings, `PEAD_MAX_POSITIONS=20`). SHADOW = stock (`STOCK_ENABLED=False`), news_call sub-threshold, pead overflow, soft-catalyst-blocked, gate-vetoed. ACTIVE in all regimes = pairs (market-neutral L/S — carried the down days). OFF=qqq_macro. RETIRED=bear_short.
+**Live legs:** REAL = news_call (mag≥0.75, Δ0.40/DTE7-13, 3d cap, 40/25/15 ratchet trail), lotto (mag≥0.70&conf≥0.85), pead (earnings, stock, `PEAD_MAX_POSITIONS=20`). SHADOW = stock (`STOCK_ENABLED=False`), news_call sub-threshold, pead overflow, **pead_option (Δ0.70/~45d ITM — the geometry that backtests broad-positive for PEAD)**, soft-catalyst-blocked, gate-vetoed, regime-blocked. ACTIVE in all regimes = pairs (market-neutral L/S — carried the down days; 18 of 25 currently-open positions). OFF=qqq_macro. RETIRED=bear_short.
 
 **Dashboard fixes (2026-06-23):** Open Positions has an explicit **SHORT/LONG** column (was a cramped `↓` reading as a dash); short legs now show their strategy + correct short-side P&L (matcher was skipping `stock_short`). Recent Trades now merges **closes** (from `closed_trades.csv`) showing realized P&L + close mechanism (Max hold / Trailing stop / Take-profit cap).
 
@@ -45,11 +103,11 @@ Working directory: `/Users/jeff/Claude/Trader`
 - **Local confirm/veto ruled OUT (8GB RAM):** tested qwen2.5:3b/gemma2:2b/phi3:mini — all confirm everything / no separation; the models that work (≥14B) don't fit (4.7-4.9GB models kernel-panicked the box). Gate must stay cloud. Only `llama3.2` (2GB) remains in Ollama.
 - **Losers cluster by CATALYST TYPE** (`loser_analysis.py`) → the pre-score soft-catalyst filter (validated −$4,038 removed, CI<0).
 
-**Analysis tools (cached, re-runnable):** `missed_movers.py` (calibration rank-IC — use after ANY prompt change), `loser_analysis.py`, `model_calibration.py`, `prefilter_pnl.py` (filter P&L), `confirm_veto_sweep.py` + `overnight_confirm_veto.py` (gate model bake-off), `regime_bypass_backtest.py` + `regime_bypass_option_pnl.py` (bypass), `groq_vs_ollama_pnl.py` (primary-scorer A/B). Caches: `yahoo_*_cache.json`, `*_cv_cache.json`, `regime_bypass_option_trades.json`.
+**Analysis tools (cached, re-runnable):** `missed_movers.py` (calibration rank-IC — use after ANY prompt change), `loser_analysis.py`, `model_calibration.py`, `prefilter_pnl.py` (filter P&L), `confirm_veto_sweep.py` + `overnight_confirm_veto.py` (gate model bake-off), `groq_vs_ollama_pnl.py` (primary-scorer A/B). NEW 2026-07: `anthropic_scorer.py` + `anthropic_backtest.py` (Anthropic-as-primary), `anthropic_gate_bakeoff.py` + `sonnet5_mistral_pipeline.py` (sonnet5×gate), `news_call_options_test.py` (expression geometry), `regime_gate_chop_sweep.py` (gate variants on 3 tapes incl. the live chop window). Caches: `yahoo_*_cache.json`, `*_cv_cache.json`, `anthropic_backtest_cache.json`, `overnight_cv_cache.json` (now also holds mistral scores of sonnet5's picks).
 
-**WHEN YOU RETURN, check:** (1) `gemini_decisions.csv` (gate decisions, now mistral-large) joined to outcomes → first live confirm/veto firings + bypass (`⚡` log) trades. (2) `groq_vs_ollama_pnl.py` → is paid-Groq-as-primary ≥ Ollama? (3) `loser_analysis.py` → soft-catalyst filter cutting loss buckets. (4) watch the option-loser tails (ACN −91%, ASTS −45% — calls bled to ~0 before the premium trailing stop fired).
+**WHEN YOU RETURN, check:** (1) **chop brake forward evidence** — `regime_block_shadow` closes in `shadow_trades.csv` since 07-16: is the dd10<60% condition blocking losers (validating) or winners (the knife-edge caveat biting)? (2) **sonnet5 swap decision** — the open TODO; if pursued, run ungated or re-tune the gate for sonnet5's candidate mix. (3) **pead_option shadow** (Δ0.70/45d) accumulating real-quote closes — the confirmation gate for flipping PEAD to options. (4) **fix `GROQ_AB_MODELS`** (deprecated 70b, 429-ing constantly — see KNOWN LIVE ISSUE). (5) weekly P&L trend post-gate-rework — did the chop brake stop the bleed?
 
-Note: `~/.claude/projects/-Users-jeff-Claude-Trader/memory/project_trader_bot.md` is 276KB — a `/consolidate-memory` pass is overdue. Focused memories now exist for the gate, regime bypass, local rule-out, and Groq A/B.
+Note: `~/.claude/projects/-Users-jeff-Claude-Trader/memory/project_trader_bot.md` is 276KB — a `/consolidate-memory` pass is overdue. Focused memories exist for the gate, regime bypass, local rule-out, Groq A/B, **sonnet5 primary scorer (`project_sonnet5_primary_scorer.md`), and the live loss review (`project_live_loss_review_202607.md`)**.
 
 ### 🚀 GO-LIVE / DEPLOYMENT PLAN (decided 2026-06-25 — for when this moves to real money + cloud)
 
@@ -77,9 +135,11 @@ so the exchange enforces it even if the bot is down.
   marks (`bot_state.json`) must persist → a small volume or a few Redis keys. (Config is already
   container-ready: `TRADER_DATA_DIR`/`TRADER_LOG_DIR` env overrides, pinned `requirements.txt`,
   no host paths in `core/`. Add a SIGTERM handler for clean restarts when you write the Dockerfile.)
-- **Instance sizing waits on the Ollama-vs-cloud-Groq-primary decision** (tiny box if cloud-primary;
-  bigger/GPU box or an Ollama sidecar if local scoring stays). The A/B + `groq_vs_ollama_backtest.py`
-  are deciding this.
+- **Instance sizing: the cloud-primary question is now answered in principle** — sonnet5 (Anthropic
+  API, ≈$1.57/mo at current volume) beat both Ollama and the Groq gpt-oss models on pick quality, so
+  the cloud box can be TINY (no local model). The remaining open call is jeff's go-ahead on paid
+  per-call scoring + the gate decision that comes with it (run sonnet5 ungated vs re-tune the gate).
+  NOTE: the production deploy won't carry shadow-trade infrastructure (jeff's call, 2026-07-16).
 
 **Caveats when flipping stops broker-side:** (1) broker stops don't cover the bot's *non-stop* exits
 (max-hold time exit, lotto take-profit cap) — those still need the bot, but they're optimization, not
