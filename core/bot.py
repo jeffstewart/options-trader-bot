@@ -84,6 +84,7 @@ from config import (
     TIME_STOP_EOD_WINDOW_MIN,
     TRADEABLE_ETFS,
     REGIME_FILTER_ENABLED, REGIME_INDEX, REGIME_MA_DAYS, REGIME_MOMENTUM_DAYS,
+    REGIME_DOWNDAY_WINDOW, REGIME_DOWNDAY_MAX_DENSITY,
     REGIME_BYPASS_MIN_MAGNITUDE,
     SEC_RSS_URL, SEC_POLL_SECS, SEC_USER_AGENT,
     NEWSAPI_URL, NEWSAPI_POLL_SECS, NEWSAPI_PARAMS,
@@ -435,13 +436,24 @@ def market_in_uptrend() -> bool:
             # days ago — pauses the long legs during multi-day pullbacks the slow 200d misses.
             mom_ok = (REGIME_MOMENTUM_DAYS <= 0 or len(closes) <= REGIME_MOMENTUM_DAYS
                       or closes[-1] >= closes[-1 - REGIME_MOMENTUM_DAYS])
-            up = above_sma and mom_ok
+            # Chop brake: too many down closes in the recent window = no follow-through for the
+            # 3-day call trades, even when level (200d) and sign (momentum) both look fine.
+            dd_win = REGIME_DOWNDAY_WINDOW
+            if dd_win > 0 and len(closes) > dd_win:
+                dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
+                                 if b < a) / dd_win
+            else:
+                dd_density = 0.0
+            chop_ok = dd_win <= 0 or dd_density < REGIME_DOWNDAY_MAX_DENSITY
+            up = above_sma and mom_ok and chop_ok
             ret_nd = (closes[-1] / closes[-1 - REGIME_MOMENTUM_DAYS] - 1) * 100 if (
                 REGIME_MOMENTUM_DAYS > 0 and len(closes) > REGIME_MOMENTUM_DAYS) else 0.0
-            log.info("📐 Regime: %s last=$%.2f vs %dd SMA=$%.2f (%s) · %dd mom %+.1f%% (%s) → %s",
+            log.info("📐 Regime: %s last=$%.2f vs %dd SMA=$%.2f (%s) · %dd mom %+.1f%% (%s) · "
+                     "%dd down-days %.0f%% (%s) → %s",
                      REGIME_INDEX, closes[-1], REGIME_MA_DAYS, sma,
                      "above" if above_sma else "below", REGIME_MOMENTUM_DAYS, ret_nd,
-                     "ok" if mom_ok else "down", "UPTREND (trading)" if up else "PAUSED (calls off)")
+                     "ok" if mom_ok else "down", dd_win, dd_density * 100,
+                     "ok" if chop_ok else "choppy", "UPTREND (trading)" if up else "PAUSED (calls off)")
     except Exception as e:
         log.warning("Regime check failed (%s) — defaulting to uptrend", e)
         up = True

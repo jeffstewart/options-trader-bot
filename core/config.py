@@ -353,6 +353,18 @@ REGIME_MA_DAYS        = 200
 # ~16% less upside, ~half the trades, some whipsaw. 0 = momentum brake off.
 REGIME_MOMENTUM_DAYS  = 3
 
+# Chop brake (added 2026-07-16). The Jun–Jul 2026 live window exposed the gate's blind spot: SPY
+# finished +1.8% (never near its 200d, momentum brake skipped only 7% of signals) yet 14/26 sessions
+# closed down and news_call lost every week — chop passes a LEVEL+SIGN gate but kills a 3-day call
+# trade that needs FOLLOW-THROUGH. Block new longs when ≥ this fraction of the last
+# REGIME_DOWNDAY_WINDOW SPY sessions closed down. regime_gate_chop_sweep.py (3 tapes): adding
+# dd10<60% to the live gate kept 98% of bull P&L at the best Sharpe tested (2.65→2.91), preserved
+# the full 2022-bear block, and flipped the live chop tape −$10.9k→+$3.9k (skip 73%). ⚠ The
+# threshold is knife-edged on the one 4-week chop sample (65% never fires, 50% blocks all) —
+# regime_block_shadow tracks what it blocks, so watch the forward evidence. 0 = chop brake off.
+REGIME_DOWNDAY_WINDOW      = int(os.environ.get("REGIME_DOWNDAY_WINDOW", "10"))
+REGIME_DOWNDAY_MAX_DENSITY = float(os.environ.get("REGIME_DOWNDAY_MAX_DENSITY", "0.60"))
+
 # High-conviction bypass (added 2026-06-23). The regime filter blocks ALL long-beta on down days,
 # but that also blocks strong IDIOSYNCRATIC catalysts (relisting/M&A/guidance) whose alpha is largely
 # market-independent. regime_bypass_option_pnl.py (real news_call option P&L, BS+IV+spreads+exits):
