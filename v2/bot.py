@@ -207,6 +207,7 @@ async def main():
     mkt.subscribe_price_stream(PRICE_WATCHLIST)
 
     stream = NewsDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
+    mkt.patch_reconnect_safety(stream, "news")
     stream.subscribe_news(handle_alpaca_news, "*")
 
     log.info("📡 All news sources starting…")

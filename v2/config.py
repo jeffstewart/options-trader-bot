@@ -38,6 +38,13 @@ LOG_DIR  = Path(os.environ.get("TRADER_LOG_DIR",  BASE_DIR / "logs"))
 ALPACA_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET = os.environ["ALPACA_SECRET_KEY"]
 
+# Dry run: when set, place_option_trade/place_stock_trade log what they WOULD do (ticker,
+# strategy, contract/shares, budget) and return without calling trading_client.submit_order.
+# Everything upstream (Alpaca connectivity, Ollama scoring, regime gate, ticker corrector, the
+# monitor/pollers starting cleanly) still runs for real -- only the actual order submission is
+# short-circuited. Use for a startup smoke test before the small-account sizing is finalized.
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODEL
 # ═══════════════════════════════════════════════════════════════════════════════

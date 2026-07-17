@@ -42,33 +42,42 @@ option_data_client = OptionHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRE
 stock_data_client  = StockHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
 stock_stream       = StockDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
 
-# Data-WS reconnect hardening (workaround for an alpaca-py bug where a failed reconnect leaks
-# the old socket without backoff, piling up against Alpaca's 1-connection-per-account limit).
-_stock_orig_connect = stock_stream._connect
-_stock_reconnect_backoff = {"s": 0.0}
 
+def patch_reconnect_safety(stream, label: str):
+    """Data-WS reconnect hardening (workaround for an alpaca-py bug: on a connect-time
+    ValueError -- e.g. Alpaca's "connection limit exceeded" -- _run_forever()'s reconnect loop
+    neither closes the socket nor backs off, so a failed connect LEAKS the old socket and
+    tight-loops (observed ~17/s, 350 in 20s on v2's news+stock streams during a smoke test
+    2026-07-17 -- the stock stream had this fix from day one, the news stream didn't, on the
+    mistaken assumption from v1 that news 'never churns'; it clearly can). Apply to ANY stream:
+    closes the stale socket first, then backs off exponentially before retrying, so a real
+    connection-limit condition degrades gracefully instead of hammering the API."""
+    orig_connect = stream._connect
+    backoff = {"s": 0.0}
 
-async def _stock_connect_safe():
-    if getattr(stock_stream, "_ws", None) is not None:
+    async def _connect_safe():
+        if getattr(stream, "_ws", None) is not None:
+            try:
+                await stream._ws.close()
+            except Exception:
+                pass
+            stream._ws = None
+        b = backoff["s"]
+        if b:
+            log.info("⏳ %s data-ws reconnect backoff %.0fs", label, b)
+            import asyncio
+            await asyncio.sleep(b)
         try:
-            await stock_stream._ws.close()
+            await orig_connect()
+            backoff["s"] = 0.0
         except Exception:
-            pass
-        stock_stream._ws = None
-    b = _stock_reconnect_backoff["s"]
-    if b:
-        log.info("⏳ data-ws reconnect backoff %.0fs", b)
-        import asyncio
-        await asyncio.sleep(b)
-    try:
-        await _stock_orig_connect()
-        _stock_reconnect_backoff["s"] = 0.0
-    except Exception:
-        _stock_reconnect_backoff["s"] = min(max(b * 2, 1.0), 30.0)
-        raise
+            backoff["s"] = min(max(b * 2, 1.0), 30.0)
+            raise
+
+    stream._connect = _connect_safe
 
 
-stock_stream._connect = _stock_connect_safe
+patch_reconnect_safety(stock_stream, "stock")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATE

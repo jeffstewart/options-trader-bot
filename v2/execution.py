@@ -130,6 +130,11 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
              contract["symbol"], contract["strike"], contract["expiry"],
              contract["bid"], contract["ask"], contract["spread_pct"] * 100, qty)
 
+    if cfg.DRY_RUN:
+        log.info("🧪 DRY RUN — would BUY %s x%d limit=$%.4f max_loss=$%.0f [%s] (no order submitted)",
+                 contract["symbol"], qty, contract["ask"], contract["ask"] * 100 * qty, strategy)
+        return None
+
     # Limit order at ask — avoids "no quote" rejection on market orders.
     req = LimitOrderRequest(symbol=contract["symbol"], qty=qty, side=OrderSide.BUY,
                            time_in_force=TimeInForce.DAY, limit_price=round(contract["ask"], 2),
@@ -241,6 +246,10 @@ def close_option_position(symbol: str, qty: int, reason: str = "trailing stop"):
 def place_stock_trade(ticker: str, stock_price: float, signal: dict, position_usd: float,
                       strategy: str = "pead") -> Optional[dict]:
     shares = max(1, int(position_usd / stock_price))
+    if cfg.DRY_RUN:
+        log.info("🧪 DRY RUN — would BUY %s x%d @ ~$%.2f [%s] (no order submitted)",
+                 ticker, shares, stock_price, strategy)
+        return None
     try:
         mkt.trading_client.submit_order(MarketOrderRequest(
             symbol=ticker, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
