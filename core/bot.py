@@ -14,6 +14,7 @@ Usage:
 
 import asyncio
 import csv
+import signal as os_signal
 import html
 import json
 import logging
@@ -3445,13 +3446,46 @@ async def main():
     stream.subscribe_news(handle_alpaca_news, "*")
 
     log.info("📡 All news sources starting…")
-    await asyncio.gather(
-        _supervised(stream._run_forever,       "news stream"),
-        _supervised(stock_stream._run_forever, "stock stream"),
-        _supervised(trailing_stop_monitor,     "trailing-stop monitor"),
-        _supervised(sec_rss_poller,            "SEC RSS poller"),
-        _supervised(newsapi_poller,            "NewsAPI poller"),
-    )
+    tasks = [
+        asyncio.create_task(_supervised(stream._run_forever,       "news stream")),
+        asyncio.create_task(_supervised(stock_stream._run_forever, "stock stream")),
+        asyncio.create_task(_supervised(trailing_stop_monitor,     "trailing-stop monitor")),
+        asyncio.create_task(_supervised(sec_rss_poller,            "SEC RSS poller")),
+        asyncio.create_task(_supervised(newsapi_poller,            "NewsAPI poller")),
+    ]
+
+    # ── Graceful shutdown (2026-07-17) ───────────────────────────────────────────────────────
+    # manage.sh sends SIGTERM via pkill, and with NO handler Python's default disposition kills
+    # the process immediately -- no finally blocks run, no chance to close the websockets.
+    # Alpaca's server then sees a dead TCP connection instead of a clean close handshake, and
+    # (observed directly this session, on both this bot and v2) won't accept a reconnect with
+    # the same credentials until whatever timeout it uses to notice the orphaned connection
+    # expires -- this is very likely the actual mechanism behind the "connection limit exceeded"
+    # cooldown seen after every restart. Catching SIGTERM/SIGINT to cancel the tasks and
+    # explicitly close both streams should let Alpaca release the slot immediately instead of
+    # waiting it out.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _on_signal(sig_name):
+        log.info("🛑 received %s — shutting down cleanly", sig_name)
+        stop_event.set()
+
+    for sig, name in ((os_signal.SIGTERM, "SIGTERM"), (os_signal.SIGINT, "SIGINT")):
+        loop.add_signal_handler(sig, _on_signal, name)
+
+    await stop_event.wait()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    log.info("🔌 Closing data-stream connections cleanly…")
+    for s in (stream, stock_stream):
+        try:
+            await s.close()
+        except Exception as e:
+            log.debug("stream close error: %s", e)
+    log.info("👋 Shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
