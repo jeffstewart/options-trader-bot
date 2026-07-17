@@ -346,35 +346,44 @@ gemini_client = (OpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_KEY)
 stock_stream       = StockDataStream(ALPACA_KEY, ALPACA_SECRET)
 
 # ── Data-WebSocket reconnect hardening (workaround for an alpaca-py reconnect bug) ──────
-# alpaca-py's _run_forever() reconnect loop, on a connect-time ValueError (e.g. Alpaca's
-# "connection limit exceeded", surfaced when the connected-message check fails), neither
-# closes the socket nor backs off (its `finally` is `sleep(0)`). Worse, _connect() overwrites
-# self._ws WITHOUT closing the previous one — so every failed reconnect LEAKS a socket, they
-# pile up against Alpaca's 1-connection-per-account limit, and it tight-loops (observed 186
-# "connection limit exceeded" in a single session). We wrap the stock stream's _connect to
-# (1) close any stale socket FIRST (stops the leak) and (2) apply exponential backoff so the
-# old connection slot is released before we retry. No effect on the healthy path (one clean
-# connect at startup → _ws is None, backoff 0). News stream is untouched (it never churns).
-_stock_orig_connect = stock_stream._connect
-_stock_reconnect_backoff = {"s": 0.0}
-async def _stock_connect_safe():
-    if getattr(stock_stream, "_ws", None) is not None:
+# CORRECTED 2026-07-17 (root-caused via a v2 smoke test that tight-looped ~17/s, 350 times in
+# 20s): "connection limit exceeded" is raised by _auth() (a SERVER-SIDE auth-time rejection),
+# NOT by _connect() (which succeeds fine — the raw socket opens, only the subsequent auth
+# handshake is rejected). The ORIGINAL version of this patch (below, kept for the git history's
+# sake) wrapped _connect() and so never actually saw this failure at all — it's been a no-op
+# for the exact error it was written to catch, this whole time. _run_forever()'s except
+# ValueError branch for this case just logs and loops with `await asyncio.sleep(0)` — no
+# backoff, and it never closes the socket _connect() already opened, so every retry leaks one.
+# The real fix wraps _start_ws() (connect+auth together): on ANY failure, close the stale
+# socket and back off exponentially before re-raising, so _run_forever's existing log-and-loop
+# behavior continues but with actual delay and no leak. Applied to BOTH streams now — the old
+# "news never churns" assumption doesn't hold (a 2026-07-17 v2 test showed it churns exactly
+# like the stock stream under the same reconnect-cooldown condition).
+def _patch_reconnect_safety(stream, label: str):
+    orig_start_ws = stream._start_ws
+    backoff = {"s": 0.0}
+
+    async def _start_ws_safe():
+        b = backoff["s"]
+        if b:
+            log.info("⏳ %s data-ws reconnect backoff %.0fs (avoiding connection-limit churn)", label, b)
+            await asyncio.sleep(b)
         try:
-            await stock_stream._ws.close()
+            await orig_start_ws()
+            backoff["s"] = 0.0          # connected → reset backoff
         except Exception:
-            pass
-        stock_stream._ws = None
-    b = _stock_reconnect_backoff["s"]
-    if b:
-        log.info("⏳ data-ws reconnect backoff %.0fs (avoiding connection-limit churn)", b)
-        await asyncio.sleep(b)
-    try:
-        await _stock_orig_connect()
-        _stock_reconnect_backoff["s"] = 0.0          # connected → reset backoff
-    except Exception:
-        _stock_reconnect_backoff["s"] = min(max(b * 2, 1.0), 30.0)
-        raise
-stock_stream._connect = _stock_connect_safe
+            if getattr(stream, "_ws", None) is not None:
+                try:
+                    await stream._ws.close()
+                except Exception:
+                    pass
+                stream._ws = None
+            backoff["s"] = min(max(b * 2, 1.0), 30.0)
+            raise
+
+    stream._start_ws = _start_ws_safe
+
+_patch_reconnect_safety(stock_stream, "stock")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MARKET DATA HELPERS
@@ -3432,6 +3441,7 @@ async def main():
 
     # Start Alpaca news WebSocket
     stream = NewsDataStream(ALPACA_KEY, ALPACA_SECRET)
+    _patch_reconnect_safety(stream, "news")
     stream.subscribe_news(handle_alpaca_news, "*")
 
     log.info("📡 All news sources starting…")
