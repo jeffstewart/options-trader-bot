@@ -109,9 +109,13 @@ MAX_POSITION_FRAC_OF_EQUITY = 0.15
 DAILY_LOSS_LIMIT_PCT     = 0.02
 DAILY_LOSS_MIN_FLOOR_USD = 25   # small, deliberately << target equity (was $2,000 in v1)
 
-# TODO(size): v1 ran up to 45 concurrent positions; at $500-1000 equity even single-digit
-# concurrency risks over-concentration. Placeholder until the sizing backtest picks a number.
-MAX_OPEN_POSITIONS = 5
+# Decided 2026-07-18: with news_call/PEAD disabled, this is now effectively the lotto cap. The
+# same-day EOD exit rule (LOTTO_SAME_DAY_EXIT) collapsed typical hold time to a few hours, so
+# lotto positions rarely overlap at all (most days: 0-1 signal; Little's-Law concurrency is near
+# zero, not the multi-day-hold math that drove v1's old 45-position cap). 3 is a safety ceiling
+# for a rare cluster day, not a scarce resource being rationed -- at LOTTO_POSITION_FRAC_OF_EQUITY
+# below, 3 slots caps worst-case simultaneous exposure at 30% of equity.
+MAX_OPEN_POSITIONS = 3
 
 # Skip a contract if ONE costs more than this x the position budget -- prevents the qty=max(1,..)
 # rule from forcing a wildly oversized fill (this is EXACTLY the mechanism that let a live
@@ -160,10 +164,14 @@ LOTTO_HARD_CAP_MULT     = 3.0
 LOTTO_STOP_LOSS_PCT     = 0.20   # hard stop anchored to entry premium, checked continuously
 LOTTO_SAME_DAY_EXIT     = True   # force close at EOD of the entry day regardless of P&L
 LOTTO_MAX_HOLD_DAYS     = 3      # fallback safety net only -- same-day exit should always fire first
-# TODO(size): v1 sized this as a fixed $250 ("small, it's a lottery ticket") -- for a $500-1000
-# account that's still 25-50% of equity in one convex bet. Should probably also become equity-
-# relative; today's sonnet5 sweep showed lotto stays fundamentally tail-driven (top3-of-42 = 71%
-# of P&L) regardless of scorer, so this is a bet-sizing question, not a selectivity one.
+# Decided 2026-07-18 (equity-relative, not v1's fixed $250 -- scales automatically with account
+# growth, per jeff's ask: a well-performing bot should size up its bets as equity grows, rather
+# than needing a manual re-tune). 10% survives a realistic losing streak reasonably well: at the
+# live gate's ~35-40% win rate, 5 losses in a row happens ~12% of the time, but since the exit
+# rule caps an average loss to ~12-22% of the BUDGET (not the whole budget), that's only ~1-2%
+# of equity per average loss -- a bad 5-loss stretch costs roughly 7-10% equity, not 50%. Also
+# matches the $100-budget tier (at today's $1,000 paper equity) that all the exit-rule testing
+# this session was actually validated at, rather than an untested extrapolation.
 LOTTO_POSITION_FRAC_OF_EQUITY = 0.10
 
 # PEAD -- stock leg only (matches what's currently live in v1; the ITM-options variant is still

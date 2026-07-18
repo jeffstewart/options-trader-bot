@@ -123,6 +123,16 @@ def test_news_call_and_pead_disabled_by_default():
     assert cfg.LOTTO_ENABLED is True
 
 
+def test_lotto_position_sizing_decided_2026_07_18():
+    """jeff's call: 10% of equity per lotto bet, 3-position cap. 10% survives a realistic losing
+    streak (per-trade avg loss is only ~12-22% of the BUDGET thanks to the exit rule, so a bad
+    5-loss stretch at a ~35-40% win rate costs ~7-10% equity, not 50%) and matches the $100-budget
+    tier the exit-rule testing was actually validated at. The 3-position cap is a safety ceiling,
+    not a scarce resource -- the same-day exit rule means lotto positions rarely overlap at all."""
+    assert cfg.LOTTO_POSITION_FRAC_OF_EQUITY == 0.10
+    assert cfg.MAX_OPEN_POSITIONS == 3
+
+
 def test_lotto_peak_trailing_tiers_removed():
     """Structural guard: the old peak-trailing LOTTO_EXIT_TIERS were replaced 2026-07-17
     (research/lotto_intraday_exit_test.py) by an entry-anchored stop-loss + same-day EOD exit.
