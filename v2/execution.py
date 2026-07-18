@@ -23,6 +23,7 @@ from alpaca.trading.enums import QueryOrderStatus
 
 import config as cfg
 import market as mkt
+from pricing import implied_vol_call
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,109 @@ def _is_earnings_headline(headline: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONTRACT SELECTION
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _passes_contract_checks(c, quote, stock_price: float, ticker: str) -> bool:
+    """Shared liquidity/quote-sanity gate -- used both for the initial target pick and to make
+    sure a mispricing-switch candidate is independently tradeable, not just cheap on paper."""
+    if getattr(c, "tradable", True) is False:
+        return False
+    root = getattr(c, "root_symbol", None)
+    if root and root != ticker:
+        return False
+    if quote is None or quote["mid"] <= 0:
+        return False
+    intrinsic = max(0.0, stock_price - float(c.strike_price))
+    if quote["mid"] < intrinsic * 0.9 or quote["mid"] > stock_price:
+        return False
+    oi = getattr(c, "open_interest", None)
+    if oi is not None and int(oi) < cfg.MIN_OPEN_INTEREST:
+        return False
+    return mkt.passes_guardrails(quote)
+
+
+def _fit_quadratic(xs: list, ys: list):
+    """Least-squares quadratic y = a*x^2 + b*x + c via the normal equations, solved with Cramer's
+    rule. No numpy -- v2 stays dependency-lean (see requirements.txt). Returns None if the strikes
+    are degenerate (e.g. all identical)."""
+    n = len(xs)
+    s1 = sum(xs); s2 = sum(x * x for x in xs); s3 = sum(x ** 3 for x in xs); s4 = sum(x ** 4 for x in xs)
+    sy = sum(ys); sxy = sum(x * y for x, y in zip(xs, ys)); sxxy = sum(x * x * y for x, y in zip(xs, ys))
+    A = [[s4, s3, s2], [s3, s2, s1], [s2, s1, n]]
+    B = [sxxy, sxy, sy]
+
+    def det3(m):
+        return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+              - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+              + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+    det = det3(A)
+    if abs(det) < 1e-12:
+        return None
+    coeffs = []
+    for col in range(3):
+        Ai = [row[:] for row in A]
+        for r in range(3):
+            Ai[r][col] = B[r]
+        coeffs.append(det3(Ai) / det)
+    return tuple(coeffs)   # (a, b, c)
+
+
+def _maybe_switch_to_cheaper_contract(ticker: str, target: dict, stock_price: float, all_contracts: list) -> dict:
+    """jeff's contract-selection idea (2026-07-18): switch off the target contract ONLY if a
+    same-expiry neighbor's implied vol sits MISPRICING_MIN_RESIDUAL_GAP below a local quadratic
+    smile fit AND passes the exact same liquidity/quote-sanity checks the target had to pass --
+    never switches into a contract that wouldn't have been independently tradeable. v1 runs this
+    same check as a shadow only (never switches); see config.py for the validation status."""
+    if not cfg.MISPRICING_SWITCH_ENABLED:
+        return target
+    try:
+        same_expiry = [c for c in all_contracts if str(c.expiration_date) == target["expiry"]]
+        same_expiry.sort(key=lambda c: abs(float(c.strike_price) - target["strike"]))
+        same_expiry = same_expiry[:7]
+        if len(same_expiry) < 4:
+            return target
+
+        dte_days = (datetime.strptime(target["expiry"], "%Y-%m-%d").date() - date.today()).days
+        T = max(dte_days, 1) / 365.0
+        candidates = []
+        for c in same_expiry:
+            quote = mkt.get_option_quote(c.symbol)
+            iv = implied_vol_call(quote["mid"], stock_price, float(c.strike_price), T) if quote else None
+            if iv is None or iv <= 0.02 or iv >= 4.9:   # solver-boundary / degenerate, not real
+                continue
+            candidates.append({"symbol": c.symbol, "strike": float(c.strike_price), "iv": iv,
+                                "quote": quote, "contract_obj": c,
+                                "ok": _passes_contract_checks(c, quote, stock_price, ticker)})
+        if len(candidates) < 4:
+            return target
+
+        fit = _fit_quadratic([c["strike"] for c in candidates], [c["iv"] for c in candidates])
+        if fit is None:
+            return target
+        a, b, cc = fit
+        for cand in candidates:
+            cand["residual"] = cand["iv"] - (a * cand["strike"] ** 2 + b * cand["strike"] + cc)
+
+        target_cand = next((c for c in candidates if c["symbol"] == target["symbol"]), None)
+        eligible = [c for c in candidates if c["ok"]]
+        if target_cand is None or not eligible:
+            return target
+
+        cheapest = min(eligible, key=lambda c: c["residual"])
+        gap = target_cand["residual"] - cheapest["residual"]
+        if cheapest["symbol"] == target["symbol"] or gap < cfg.MISPRICING_MIN_RESIDUAL_GAP:
+            return target
+
+        log.info("  🔍 mispricing switch: %s (resid %+.4f) -> %s (resid %+.4f, gap %.4f) [%s]",
+                 target["symbol"], target_cand["residual"], cheapest["symbol"], cheapest["residual"], gap, ticker)
+        q, oi = cheapest["quote"], getattr(cheapest["contract_obj"], "open_interest", None)
+        return {"symbol": cheapest["symbol"], "strike": cheapest["strike"], "expiry": target["expiry"],
+                "bid": q["bid"], "ask": q["ask"], "mid": q["mid"], "spread_pct": q["spread_pct"],
+                "open_interest": int(oi) if oi is not None else None}
+    except Exception as e:
+        log.debug("mispricing switch check failed for %s: %s", ticker, e)
+        return target
 
 
 def pick_call_contract(ticker: str, stock_price: float, dte_min: int, dte_max: int,
@@ -76,31 +180,22 @@ def pick_call_contract(ticker: str, stock_price: float, dte_min: int, dte_max: i
         abs(float(c.strike_price) - target_strike),
     ))
 
+    target = None
     for c in contracts[:5]:
-        if getattr(c, "tradable", True) is False:
-            continue
-        root = getattr(c, "root_symbol", None)
-        if root and root != ticker:
-            continue
         quote = mkt.get_option_quote(c.symbol)
-        if quote is None:
-            continue
-        intrinsic = max(0.0, stock_price - float(c.strike_price))
-        if quote["mid"] <= 0 or quote["mid"] < intrinsic * 0.9 or quote["mid"] > stock_price:
-            log.info("  → %s quote $%.2f inconsistent w/ stock $%.2f strike $%.2f — skipping (bad data)",
-                     c.symbol, quote["mid"], stock_price, float(c.strike_price))
+        if not _passes_contract_checks(c, quote, stock_price, ticker):
             continue
         oi = getattr(c, "open_interest", None)
-        if oi is not None and int(oi) < cfg.MIN_OPEN_INTEREST:
-            continue
-        if not mkt.passes_guardrails(quote):
-            continue
-        return {"symbol": c.symbol, "strike": float(c.strike_price), "expiry": str(c.expiration_date),
-                "bid": quote["bid"], "ask": quote["ask"], "mid": quote["mid"],
-                "spread_pct": quote["spread_pct"], "open_interest": int(oi) if oi is not None else None}
+        target = {"symbol": c.symbol, "strike": float(c.strike_price), "expiry": str(c.expiration_date),
+                  "bid": quote["bid"], "ask": quote["ask"], "mid": quote["mid"],
+                  "spread_pct": quote["spread_pct"], "open_interest": int(oi) if oi is not None else None}
+        break
 
-    log.info("  → no liquid contracts found for %s after guardrail checks", ticker)
-    return None
+    if target is None:
+        log.info("  → no liquid contracts found for %s after guardrail checks", ticker)
+        return None
+
+    return _maybe_switch_to_cheaper_contract(ticker, target, stock_price, contracts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

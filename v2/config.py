@@ -193,6 +193,22 @@ MIN_DAYS_TO_EXPIRY = 14
 MAX_DAYS_TO_EXPIRY = 21
 TARGET_DELTA       = 0.50
 
+# ── Contract-mispricing switch (2026-07-18) ────────────────────────────────────────────────────
+# jeff's idea: instead of always taking the contract nearest the target delta/DTE, check whether a
+# same-expiry neighbor is priced BELOW the local IV smile (implied vol backed out from its own
+# real quote, fit a local quadratic across ~7 nearby strikes) -- i.e. the market hasn't repriced
+# that specific strike as fast as the rest of the chain after the news. research/
+# lotto_mispricing_test.py found a small, promising-but-unvalidated signal on a historical n=15
+# (switching improved win%/avg $/total $, but individual residual gaps were often within
+# plausible fit-noise range); v1 (core/bot.py) runs the SAME check as a SHADOW ONLY (logs the
+# comparison, never changes what gets bought) so the two can be compared going forward. jeff
+# opted to wire this in live for v2 despite the small validated sample ("I have a lot of faith in
+# this") -- MISPRICING_MIN_RESIDUAL_GAP exists specifically to guard against acting on pure fit
+# noise: only switch when the gap is meaningfully larger than what spot-checking the historical
+# cases showed noise alone could produce (most noise-range gaps were <=0.02 IV points).
+MISPRICING_SWITCH_ENABLED   = True
+MISPRICING_MIN_RESIDUAL_GAP = 0.02   # IV points; below this, don't switch off the target contract
+
 # ── Regime gate -- runs FIRST, before any scoring call (local or paid) ─────────────────────────
 # With pairs/bear_short/qqq_macro all gone, NOTHING in v2 needs scoring during a downtrend (no
 # all-regime strategy remains) -- so the gate can sit strictly before scoring, no two-stage
