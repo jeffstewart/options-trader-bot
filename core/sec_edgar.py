@@ -91,7 +91,15 @@ async def load_cik_ticker_map(session: aiohttp.ClientSession, user_agent: str) -
         except Exception:
             pass
 
-    _cik_ticker_map = {int(v["cik_str"]): v["ticker"] for v in data.values()}
+    # SEC's file lists the primary common-stock ticker FIRST for each CIK, with preferred-share/
+    # alternate-class tickers following (verified: 1470/8017 CIKs have >1 entry -- e.g. GOOGL before
+    # GOOG/GOOGM/GOOGN, JPM before its ~8 preferred-share tickers). A naive dict comprehension keeps
+    # the LAST entry seen instead, which silently picks an arbitrary (often illiquid/wrong) ticker --
+    # caught live 2026-07-18: an Empire State Realty OP 8-K resolved to "OGCP" instead of a real
+    # common-stock symbol. setdefault keeps the first (primary) entry per CIK.
+    _cik_ticker_map = {}
+    for v in data.values():
+        _cik_ticker_map.setdefault(int(v["cik_str"]), v["ticker"])
     _cik_ticker_loaded_at = time.time()
     return _cik_ticker_map
 

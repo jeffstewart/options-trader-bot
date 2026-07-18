@@ -85,3 +85,31 @@ def test_cik_ticker_map_resolves_known_cik(monkeypatch, tmp_path):
 
     result = asyncio.run(sec_edgar.load_cik_ticker_map(_ExplodingSession(), "test-agent"))
     assert result == {1655210: "BYND"}
+
+
+def test_cik_ticker_map_prefers_first_ticker_for_multi_class_cik(monkeypatch, tmp_path):
+    """Caught live 2026-07-18: an Empire State Realty OP 8-K resolved to 'OGCP' instead of a real
+    common-stock symbol, because SEC's file lists 3 tickers for that one CIK (ESBA/FISK/OGCP,
+    in that order) and a naive dict comprehension kept whichever came LAST. SEC's file orders the
+    primary common-stock ticker first for every multi-class CIK (verified: GOOGL before
+    GOOG/GOOGM/GOOGN, JPM before ~8 preferred-share tickers) -- must keep the FIRST one seen."""
+    import json as _json2
+
+    cache_file = tmp_path / "sec_cik_tickers.json"
+    cache_file.write_text(_json2.dumps({
+        "0": {"cik_str": 1553079, "ticker": "ESBA", "title": "Empire State Realty OP, L.P."},
+        "1": {"cik_str": 1553079, "ticker": "FISK", "title": "Empire State Realty OP, L.P."},
+        "2": {"cik_str": 1553079, "ticker": "OGCP", "title": "Empire State Realty OP, L.P."},
+    }))
+    monkeypatch.setattr(sec_edgar, "CIK_TICKER_CACHE", str(cache_file))
+    monkeypatch.setattr(sec_edgar, "_cik_ticker_map", {})
+    monkeypatch.setattr(sec_edgar, "_cik_ticker_loaded_at", 0.0)
+
+    import asyncio
+
+    class _ExplodingSession:
+        def get(self, *a, **k):
+            raise AssertionError("should not hit the network when a fresh cache file exists")
+
+    result = asyncio.run(sec_edgar.load_cik_ticker_map(_ExplodingSession(), "test-agent"))
+    assert result[1553079] == "ESBA"
