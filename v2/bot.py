@@ -72,6 +72,20 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
             log.info("  🚧 soft-catalyst (%r) — pre-score drop", soft)
             return
 
+    # Lotto entry cutoff, checked BEFORE scoring (2026-07-18): a signal arriving this late can
+    # only route to lotto right now (news_call/PEAD disabled), and lotto force-closes same-day --
+    # scoring it is pure wasted spend once the scorer swap to a paid model (Sonnet) happens. Only
+    # safe to skip scoring entirely because lotto is the ONLY enabled strategy today; if
+    # news_call/PEAD are ever re-enabled this condition stops applying on its own (they don't
+    # share lotto's same-day-exit constraint). execute_lotto's own post-score check stays in place
+    # as a backstop regardless -- scoring + dispatch takes real time, so the window can still be
+    # crossed between this check and order placement.
+    if (cfg.LOTTO_ENABLED and not cfg.NEWS_CALL_ENABLED and not cfg.PEAD_ENABLED
+            and mkt.near_market_close(within_min=cfg.LOTTO_ENTRY_CUTOFF_MIN_BEFORE_CLOSE)):
+        log.info("  → too close to the same-day forced exit (<%dmin left) — skipping scoring (lotto is the only leg live)",
+                 cfg.LOTTO_ENTRY_CUTOFF_MIN_BEFORE_CLOSE)
+        return
+
     signal = scoring.score_article(headline, body, source)
     if not signal:
         return

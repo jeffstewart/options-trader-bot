@@ -36,6 +36,42 @@ def test_regime_gate_open_allows_scoring(monkeypatch):
     assert called == [1], "scorer SHOULD be called once the regime gate is open"
 
 
+def test_lotto_entry_cutoff_blocks_scoring_when_lotto_is_the_only_leg(monkeypatch):
+    """jeff's ask (2026-07-18): once the scorer swap to a paid model (Sonnet) happens, every
+    scored article costs API credits, so the late-day entry cutoff must be checked BEFORE
+    scoring, not just inside execute_lotto after the (paid) call already happened."""
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
+    monkeypatch.setattr(mkt, "near_market_close", lambda within_min=0: True)
+    monkeypatch.setattr(cfg, "NEWS_CALL_ENABLED", False)
+    monkeypatch.setattr(cfg, "PEAD_ENABLED", False)
+
+    called = []
+    monkeypatch.setattr(scoring, "score_article", lambda h, b, s: called.append(1) or None)
+
+    asyncio.run(bot.process_signal("Some bullish headline", "body", "test"))
+    assert called == [], "scorer must not be called inside the lotto entry-cutoff window"
+
+
+def test_lotto_entry_cutoff_does_not_block_scoring_when_other_legs_are_live(monkeypatch):
+    """Safety property: the pre-score skip is only valid because lotto (same-day exit) is the
+    ONLY enabled strategy today. If news_call/PEAD (no same-day-exit constraint) are ever
+    re-enabled, this must stop applying automatically rather than silently dropping their
+    signals near the close too."""
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
+    monkeypatch.setattr(mkt, "near_market_close", lambda within_min=0: True)
+    monkeypatch.setattr(cfg, "NEWS_CALL_ENABLED", True)
+    monkeypatch.setattr(cfg, "PEAD_ENABLED", False)
+
+    called = []
+    monkeypatch.setattr(scoring, "score_article",
+                        lambda h, b, s: called.append(1) or {"sentiment": "neutral"})
+
+    asyncio.run(bot.process_signal("Some bullish headline", "body", "test"))
+    assert called == [1], "must still score when a non-lotto leg (without the same-day constraint) is live"
+
+
 def test_ticker_corrector_overrides_primary_scorer_ticker(monkeypatch):
     """Validated 2026-07-16 (research/prompt_v2_test.py): the corrector fixes wrong-beneficiary
     and invented-ticker errors from the primary scorer. Here it should change which ticker the
