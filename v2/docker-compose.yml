@@ -1,0 +1,27 @@
+# Local stand-in for the eventual Fly.io/systemd deploy (docs/HANDOFF.md's go-live plan):
+# a single always-on container, auto-restarted by the platform, with data/logs bind-mounted so
+# the host-side dashboard.py (NOT containerized -- run it separately with the venv, same as
+# today) keeps working against the exact same files.
+#
+# Usage:
+#   docker compose up -d --build      # build + start, detached
+#   docker compose logs -f            # follow logs (also written to ./logs/bot.log)
+#   docker compose down               # SIGTERM -> graceful shutdown -> stop
+services:
+  v2-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Ollama runs on the HOST, not in this container -- "localhost" inside the container means
+      # the container itself, not the Mac. host.docker.internal is Docker Desktop's (Mac/Windows)
+      # built-in name for the host; extra_hosts below adds the same mapping on Linux.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - TRADER_DATA_DIR=/app/data
+      - TRADER_LOG_DIR=/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs

@@ -1,0 +1,17 @@
+# Never bake secrets or local state into the image -- .env is injected at container RUN time
+# (docker-compose's env_file), data/logs are bind-mounted volumes populated at runtime.
+.env
+.env.bak
+data/
+logs/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+.dockerignore

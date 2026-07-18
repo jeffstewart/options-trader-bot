@@ -55,3 +55,39 @@ python bot.py
 ```
 
 Tests: `pytest` (self-contained — own `pytest.ini`, own `tests/conftest.py`).
+
+## Running it in a container
+
+The always-on-container step from `docs/HANDOFF.md`'s go-live plan, brought forward for local
+use so the bot survives a crash/reboot without a hand-run terminal (2026-07-19; see
+[[project_v2_small_account_architecture]] memory — this replaced the "build a manage.sh-style
+watchdog" alternative). Only `bot.py` is containerized; keep running `dashboard.py` on the host
+with the normal venv (`../.venv/bin/python dashboard.py`) — it reads the same bind-mounted
+`data/`/`logs/` files, so nothing about it changes.
+
+```bash
+ollama serve &                 # Ollama stays on the HOST, not in the container
+ollama pull llama3.2
+docker compose up -d --build   # build the image, start detached, auto-restart on crash/reboot
+docker compose logs -f         # follow live output (also written to ./logs/bot.log)
+docker compose down            # SIGTERM -> bot.py's graceful shutdown -> stop
+```
+
+Gotchas specific to running in a container (not present when running `python bot.py` directly):
+- **Ollama must be reached via `host.docker.internal`, not `localhost`** — "localhost" inside the
+  container means the container itself. `docker-compose.yml` already sets
+  `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` and adds the Linux-compatible
+  `extra_hosts` mapping (Docker Desktop on Mac supports this hostname natively).
+- **`.env` is never baked into the image** (`.dockerignore` excludes it) — real keys are injected
+  at `docker compose up` time via `env_file`, not present in the image itself even if it's later
+  pushed to a registry.
+- **`DRY_RUN=1` for a supervised test run**: `DRY_RUN=1 docker compose up --build` (or add it to
+  `environment:` in `docker-compose.yml` temporarily) — logs "would trade" instead of placing real
+  orders. Normal operation leaves it unset (real paper trades), per jeff's call 2026-07-19.
+- **Data/logs are bind-mounted, not baked in** (`./data:/app/data`, `./logs:/app/logs`) — deleting
+  the container/image never touches `bot_state.json`/`trades.csv`/etc.
+
+Next step when this actually moves to real money: deploy the same image to Fly.io (the standout
+fit per `docs/HANDOFF.md` — singleton machines + volumes + auto-restart + health) or a small VM
+with `systemd Restart=always`, and move stops broker-side. Not done yet — this is still the paper
+account, still local.
