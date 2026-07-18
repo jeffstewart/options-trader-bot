@@ -593,7 +593,10 @@ def log_contract_mispricing_shadow(ticker: str, contract: dict, stock_price: flo
     win rate/avg $/total $, but individual residual gaps were often within plausible fit-noise
     range) -- this accumulates a much bigger REAL forward sample by logging every live pick's
     neighbor-strike comparison to contract_mispricing_shadow.csv, so the idea can be validated
-    (or ruled out) on real data before ever changing what contract actually gets bought.
+    (or ruled out) on real data before ever changing what contract actually gets bought. Called
+    from both execute_lotto_trade_fn and execute_equity_trade (news_call only, added 2026-07-18 --
+    news_call fires far more often than lotto, so it gathers a usable sample much faster); the
+    `strategy` column distinguishes the two in the CSV.
     Fails silently -- a probe error must never surface as a trading problem."""
     try:
         expiry = datetime.strptime(contract["expiry"], "%Y-%m-%d").date()
@@ -1093,7 +1096,11 @@ def execute_equity_trade(ticker: str, signal: dict, option_usd: float, strategy:
     elif strategy == "news_call":
         opt_kw = dict(dte_min=NEWS_CALL_DTE_MIN, dte_max=NEWS_CALL_DTE_MAX,
                       target_delta=NEWS_CALL_TARGET_DELTA, budget_mult=NEWS_CALL_BUDGET_MULT)
-    place_option_trade(ticker, stock_price, signal, option_usd, strategy=strategy, **opt_kw)
+    contract = place_option_trade(ticker, stock_price, signal, option_usd, strategy=strategy, **opt_kw)
+    if contract and strategy == "news_call":
+        # news_call fires far more often than lotto -- reuses the same shadow probe to gather
+        # forward mispricing data faster (2026-07-18; see log_contract_mispricing_shadow docstring).
+        log_contract_mispricing_shadow(ticker, contract, stock_price, strategy)
     log.info("⏱  Trade path completed in %.0fms  [%s %s]",
              (datetime.now(timezone.utc) - t0).total_seconds() * 1000, ticker, strategy)
 
