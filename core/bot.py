@@ -26,8 +26,10 @@ from typing import Optional
 
 import aiohttp
 import feedparser
+import numpy as np
 import sec_edgar
 from openai import OpenAI, RateLimitError
+from pricing import implied_vol_call
 from alpaca.data.live import NewsDataStream, StockDataStream
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical import StockHistoricalDataClient
@@ -580,6 +582,88 @@ def log_contract_pick(ticker: str, stock_price: float, strategy: str, target_del
             ])
     except Exception as e:
         log.debug("contract-pick probe failed: %s", e)
+
+
+def log_contract_mispricing_shadow(ticker: str, contract: dict, stock_price: float, strategy: str):
+    """Shadow probe (2026-07-18, paper/read-only -- NEVER affects the real trade already placed).
+    jeff's contract-selection idea: right after buying the target contract, check whether a
+    NEARBY strike at the SAME expiry looks cheap relative to the local IV smile at that moment.
+    research/lotto_mispricing_test.py found a small, promising-but-unvalidated signal on a
+    historical n=15 (switching to the lowest-smile-residual contract beat the current pick on
+    win rate/avg $/total $, but individual residual gaps were often within plausible fit-noise
+    range) -- this accumulates a much bigger REAL forward sample by logging every live pick's
+    neighbor-strike comparison to contract_mispricing_shadow.csv, so the idea can be validated
+    (or ruled out) on real data before ever changing what contract actually gets bought.
+    Fails silently -- a probe error must never surface as a trading problem."""
+    try:
+        expiry = datetime.strptime(contract["expiry"], "%Y-%m-%d").date()
+        target_strike = float(contract["strike"])
+
+        resp = trading_client.get_option_contracts(GetOptionContractsRequest(
+            underlying_symbols=[ticker],
+            type=ContractType.CALL,
+            expiration_date=expiry,
+            strike_price_gte=str(round(target_strike * 0.80, 2)),
+            strike_price_lte=str(round(target_strike * 1.20, 2)),
+        ))
+        neighbors = getattr(resp, "option_contracts", []) or []
+        if len(neighbors) < 4:
+            return   # not enough points for a meaningful quadratic smile fit
+
+        # Keep only the closest few strikes on each side of target -- a wide gte/lte band can
+        # return dozens of real strikes (verified live: AAPL returned 36 across +/-20%, spanning
+        # deep ITM to deep OTM), and fitting a quadratic across that whole range picked a deep-ITM
+        # strike 70 points from target as "cheapest" -- an edge-of-fit artifact, not a genuinely
+        # NEARBY contract. research/lotto_mispricing_test.py validated a local +/-3-strike
+        # neighborhood, not the whole visible chain.
+        neighbors.sort(key=lambda c: abs(float(c.strike_price) - target_strike))
+        neighbors = neighbors[:7]
+
+        dte_days = (expiry - date.today()).days
+        T = max(dte_days, 1) / 365.0
+        candidates = []
+        for c in neighbors:
+            quote = get_option_quote(c.symbol)
+            if not quote or quote["mid"] <= 0:
+                continue
+            iv = implied_vol_call(quote["mid"], stock_price, float(c.strike_price), T, r=0.04)
+            if iv is None or iv <= 0.02 or iv >= 4.9:   # solver-boundary / degenerate, not real
+                continue
+            candidates.append({"symbol": c.symbol, "strike": float(c.strike_price),
+                                "mid": quote["mid"], "iv": iv})
+        if len(candidates) < 4:
+            return
+
+        strikes_arr = np.array([c["strike"] for c in candidates])
+        ivs_arr = np.array([c["iv"] for c in candidates])
+        coeffs = np.polyfit(strikes_arr, ivs_arr, deg=2)
+        fitted = np.polyval(coeffs, strikes_arr)
+        for c, f in zip(candidates, fitted):
+            c["residual"] = c["iv"] - float(f)
+
+        target = next((c for c in candidates if c["symbol"] == contract["symbol"]), None)
+        if target is None:
+            return
+        cheapest = min(candidates, key=lambda c: c["residual"])
+
+        path = "contract_mispricing_shadow.csv"
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["timestamp", "ticker", "strategy", "stock_price", "n_candidates",
+                            "target_symbol", "target_strike", "target_mid", "target_iv", "target_residual",
+                            "cheapest_symbol", "cheapest_strike", "cheapest_mid", "cheapest_iv", "cheapest_residual",
+                            "residual_gap", "would_switch"])
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(), ticker, strategy, f"{stock_price:.4f}", len(candidates),
+                target["symbol"], target["strike"], f"{target['mid']:.4f}", f"{target['iv']:.4f}", f"{target['residual']:+.4f}",
+                cheapest["symbol"], cheapest["strike"], f"{cheapest['mid']:.4f}", f"{cheapest['iv']:.4f}", f"{cheapest['residual']:+.4f}",
+                f"{target['residual'] - cheapest['residual']:+.4f}",
+                cheapest["symbol"] != target["symbol"],
+            ])
+    except Exception as e:
+        log.debug("contract-mispricing shadow probe failed: %s", e)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUARDRAILS
@@ -1210,6 +1294,7 @@ def execute_lotto_trade_fn(ticker: str, signal: dict, headline: str = "", body: 
     if sym in _monitored_positions:
         _monitored_positions[sym]["materiality"] = mat
     log_lotto_materiality(ticker, sym, mat, mag, conf)
+    log_contract_mispricing_shadow(ticker, contract, stock_price, "lotto")
 
 
 # ── BEAR-SHORT EXECUTION ──────────────────────────────────────────────────────
