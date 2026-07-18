@@ -2929,6 +2929,7 @@ async def process_signal(headline: str, body: str, source: str,
     if not signal:
         return
 
+    signal["_source"] = source   # for trades.csv attribution (Alpaca/Benzinga vs SEC EDGAR vs NewsAPI)
     magnitude  = float(signal.get("magnitude", 0))
     confidence = float(signal.get("confidence", 0))
 
@@ -3310,7 +3311,7 @@ def log_trade(ticker, contract, qty, signal, entry_price, strategy="news_call"):
                 "timestamp", "source_ticker", "option_symbol", "strike", "expiry",
                 "qty", "bid", "ask", "cost_basis", "max_loss",
                 "spread_pct", "trailing_stop_pct",
-                "confidence", "magnitude", "reasoning", "strategy", "scorer",
+                "confidence", "magnitude", "reasoning", "strategy", "scorer", "news_source",
             ])
         w.writerow([
             datetime.now(timezone.utc).isoformat(),
@@ -3322,6 +3323,7 @@ def log_trade(ticker, contract, qty, signal, entry_price, strategy="news_call"):
             f"{TRAILING_STOP_PCT * 100:.0f}%",
             signal.get("confidence"), signal.get("magnitude"),
             signal.get("reasoning", ""), strategy, signal.get("_scorer", "ollama"),
+            signal.get("_source", ""),
         ])
 
 CLOSED_TRADES_FILE = "closed_trades.csv"
@@ -3366,7 +3368,7 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
                 "timestamp", "source_ticker", "option_symbol", "strike", "expiry",
                 "qty", "bid", "ask", "cost_basis", "max_loss",
                 "spread_pct", "trailing_stop_pct",
-                "confidence", "magnitude", "reasoning", "strategy", "scorer",
+                "confidence", "magnitude", "reasoning", "strategy", "scorer", "news_source",
             ])
         w.writerow([
             datetime.now(timezone.utc).isoformat(),
@@ -3378,6 +3380,7 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
             f"{STOCK_TRAIL_PCT * 100:.0f}%",
             signal.get("confidence"), signal.get("magnitude"),
             signal.get("reasoning", ""), strategy, signal.get("_scorer", "ollama"),
+            signal.get("_source", ""),
         ])
 
 # ═══════════════════════════════════════════════════════════════════════════════

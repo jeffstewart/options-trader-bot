@@ -74,6 +74,7 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
     if not signal:
         return
     signal["_headline"] = headline
+    signal["_source"] = source
 
     sentiment = signal.get("sentiment")
     if sentiment != "bullish":

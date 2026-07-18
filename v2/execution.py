@@ -348,13 +348,13 @@ def log_trade(ticker, contract, qty, signal, entry_price, strategy):
         if write_header:
             w.writerow(["timestamp", "source_ticker", "option_symbol", "strike", "expiry", "qty",
                         "bid", "ask", "cost_basis", "max_loss", "spread_pct", "confidence",
-                        "magnitude", "reasoning", "strategy", "corrected_ticker"])
+                        "magnitude", "reasoning", "strategy", "corrected_ticker", "news_source"])
         w.writerow([datetime.now(timezone.utc).isoformat(), ticker, contract["symbol"],
                    contract["strike"], contract["expiry"], qty, f"{contract['bid']:.4f}",
                    f"{contract['ask']:.4f}", f"{entry_price:.4f}", f"{entry_price * 100 * qty:.2f}",
                    f"{contract['spread_pct'] * 100:.1f}%", signal.get("confidence"),
                    signal.get("magnitude"), signal.get("reasoning", ""), strategy,
-                   signal.get("_ticker_corrected", "")])
+                   signal.get("_ticker_corrected", ""), signal.get("_source", "")])
 
 
 def log_trade_stock(ticker, shares, entry_price, signal, strategy):
@@ -364,12 +364,12 @@ def log_trade_stock(ticker, shares, entry_price, signal, strategy):
         if write_header:
             w.writerow(["timestamp", "source_ticker", "option_symbol", "strike", "expiry", "qty",
                         "bid", "ask", "cost_basis", "max_loss", "spread_pct", "confidence",
-                        "magnitude", "reasoning", "strategy", "corrected_ticker"])
+                        "magnitude", "reasoning", "strategy", "corrected_ticker", "news_source"])
         w.writerow([datetime.now(timezone.utc).isoformat(), ticker, "-", "-", "-", shares,
                    f"{entry_price:.4f}", f"{entry_price:.4f}", f"{entry_price:.4f}",
                    f"{entry_price * shares:.2f}", "0.0%", signal.get("confidence"),
                    signal.get("magnitude"), signal.get("reasoning", ""), strategy,
-                   signal.get("_ticker_corrected", "")])
+                   signal.get("_ticker_corrected", ""), signal.get("_source", "")])
 
 
 def log_closed_trade(symbol: str, pos: dict, exit_price: float, pnl_usd: float, reason: str = "stop"):
