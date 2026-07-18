@@ -149,8 +149,15 @@ LOTTO_MAX_DTE        = 21
 LOTTO_STRIKE_HI_MULT = 1.25
 LOTTO_HARD_CAP_ENABLED  = True
 LOTTO_HARD_CAP_MULT     = 3.0
-LOTTO_EXIT_TIERS        = [(1.0, 0.40), (3.0, 0.30), (float("inf"), 0.20)]
-LOTTO_MAX_HOLD_DAYS     = 3
+# Exit rule replaced 2026-07-17 (research/lotto_intraday_exit_test.py, 15-min-bar Black-Scholes sim
+# on the sonnet5 mag>=0.3/conf>=0.70 gate): the old peak-trailing tiers let a green-at-the-open trade
+# drift back to a big loss by the close. Same-day EOD exit + a stop-loss anchored to ENTRY (not peak)
+# beat the old tiers on both total $ and win% while cutting avg loss roughly in half (-$22 -> -$12 at
+# $100 budget) and capping worst-case loss (-$40 vs uncapped). All of 15-35% stop thresholds tested
+# performed similarly; 20% chosen as tight enough to matter without clipping every recoverable dip.
+LOTTO_STOP_LOSS_PCT     = 0.20   # hard stop anchored to entry premium, checked continuously
+LOTTO_SAME_DAY_EXIT     = True   # force close at EOD of the entry day regardless of P&L
+LOTTO_MAX_HOLD_DAYS     = 3      # fallback safety net only -- same-day exit should always fire first
 # TODO(size): v1 sized this as a fixed $250 ("small, it's a lottery ticket") -- for a $500-1000
 # account that's still 25-50% of equity in one convex bet. Should probably also become equity-
 # relative; today's sonnet5 sweep showed lotto stays fundamentally tail-driven (top3-of-42 = 71%

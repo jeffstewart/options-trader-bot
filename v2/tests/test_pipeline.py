@@ -108,3 +108,38 @@ def test_no_pairs_or_bear_short_config_exists():
     assert not hasattr(cfg, "PAIRS_ENABLED")
     assert not hasattr(cfg, "BEAR_SHORT_ENABLED")
     assert not hasattr(cfg, "HYBRID_SCORER_ENABLED")   # confirm/veto gate must not reappear either
+
+
+def test_lotto_peak_trailing_tiers_removed():
+    """Structural guard: the old peak-trailing LOTTO_EXIT_TIERS were replaced 2026-07-17
+    (research/lotto_intraday_exit_test.py) by an entry-anchored stop-loss + same-day EOD exit.
+    If the tiered config reappears, something regressed the old exit rule back in."""
+    assert not hasattr(cfg, "LOTTO_EXIT_TIERS")
+    assert not hasattr(mkt, "lotto_trail_pct")
+    assert cfg.LOTTO_STOP_LOSS_PCT == 0.20
+    assert cfg.LOTTO_SAME_DAY_EXIT is True
+
+
+def test_lotto_stop_loss_is_entry_anchored_not_peak_anchored():
+    """The whole point of the new rule vs. the old trail: the stop must not move up with the
+    peak. A trade that spiked to +50% then fell back to -10% must still trip the entry-anchored
+    20% stop's threshold check the same as a trade that never rallied at all."""
+    pos = {"entry_price": 1.00}
+    assert not mkt._lotto_stop_loss_hit(pos, 0.85)   # -15%, above the 20% stop
+    assert mkt._lotto_stop_loss_hit(pos, 0.80)        # exactly -20% -> triggers
+    assert mkt._lotto_stop_loss_hit(pos, 0.50)        # deep loss -> triggers
+    # peak_price is irrelevant to this check -- only entry_price and current mid matter
+    pos_after_spike = {"entry_price": 1.00, "peak_price": 1.50}
+    assert mkt._lotto_stop_loss_hit(pos_after_spike, 0.79)
+
+
+def test_lotto_same_day_exit_requires_same_calendar_date(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    pos_today = {"entry_dt": now - timedelta(hours=2)}
+    pos_yesterday = {"entry_dt": now - timedelta(days=1)}
+    assert mkt._lotto_same_day_exit_hit(pos_today)
+    assert not mkt._lotto_same_day_exit_hit(pos_yesterday)
+
+    monkeypatch.setattr(cfg, "LOTTO_SAME_DAY_EXIT", False)
+    assert not mkt._lotto_same_day_exit_hit(pos_today)

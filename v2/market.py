@@ -44,37 +44,39 @@ stock_stream       = StockDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
 
 
 def patch_reconnect_safety(stream, label: str):
-    """Data-WS reconnect hardening (workaround for an alpaca-py bug: on a connect-time
-    ValueError -- e.g. Alpaca's "connection limit exceeded" -- _run_forever()'s reconnect loop
-    neither closes the socket nor backs off, so a failed connect LEAKS the old socket and
-    tight-loops (observed ~17/s, 350 in 20s on v2's news+stock streams during a smoke test
-    2026-07-17 -- the stock stream had this fix from day one, the news stream didn't, on the
-    mistaken assumption from v1 that news 'never churns'; it clearly can). Apply to ANY stream:
-    closes the stale socket first, then backs off exponentially before retrying, so a real
-    connection-limit condition degrades gracefully instead of hammering the API."""
-    orig_connect = stream._connect
+    """Data-WS reconnect hardening. Root-caused 2026-07-17 (a v2 smoke test tight-looped ~17/s,
+    350 times in 20s): alpaca-py's "connection limit exceeded" is raised by _auth() (a SERVER-
+    SIDE auth-time rejection), not by _connect() (which succeeds -- the raw socket opens fine).
+    _run_forever()'s except ValueError branch for this case just logs and loops with
+    `await asyncio.sleep(0)` -- no backoff, AND it never closes the socket _connect() already
+    opened, so every retry leaks another one. Wrapping _connect() alone (the original version of
+    this fix) never saw the failure at all. The real fix has to wrap _start_ws() (connect+auth
+    together): on ANY failure, close the stale socket and back off exponentially before
+    re-raising, so _run_forever's existing log-and-loop behavior continues but with actual delay
+    and no leak. Apply to ANY stream (stock, news)."""
+    orig_start_ws = stream._start_ws
     backoff = {"s": 0.0}
 
-    async def _connect_safe():
-        if getattr(stream, "_ws", None) is not None:
-            try:
-                await stream._ws.close()
-            except Exception:
-                pass
-            stream._ws = None
+    async def _start_ws_safe():
         b = backoff["s"]
         if b:
             log.info("⏳ %s data-ws reconnect backoff %.0fs", label, b)
             import asyncio
             await asyncio.sleep(b)
         try:
-            await orig_connect()
+            await orig_start_ws()
             backoff["s"] = 0.0
         except Exception:
+            if getattr(stream, "_ws", None) is not None:
+                try:
+                    await stream._ws.close()
+                except Exception:
+                    pass
+                stream._ws = None
             backoff["s"] = min(max(b * 2, 1.0), 30.0)
             raise
 
-    stream._connect = _connect_safe
+    stream._start_ws = _start_ws_safe
 
 
 patch_reconnect_safety(stock_stream, "stock")
@@ -121,18 +123,11 @@ def pead_trail_pct(gain: float) -> float:
     return cfg.PEAD_EXIT_TIERS[-1][1]
 
 
-def lotto_trail_pct(gain: float) -> float:
-    for thresh, trail in cfg.LOTTO_EXIT_TIERS:
-        if gain < thresh:
-            return trail
-    return cfg.LOTTO_EXIT_TIERS[-1][1]
-
-
 def long_trail_for(strategy: str, asset_type: str, gain: float) -> float:
+    # lotto has no peak-trailing branch -- it uses a dedicated entry-anchored stop-loss +
+    # same-day EOD exit instead (see _lotto_stop_loss_hit / _lotto_same_day_exit_hit below).
     if strategy == "pead":
         return pead_trail_pct(gain)
-    if strategy == "lotto":
-        return lotto_trail_pct(gain)
     if strategy == "news_call":
         return news_call_trail_pct(gain)
     if strategy == "stock":
@@ -165,6 +160,25 @@ def _time_stop_hit(pos: dict) -> bool:
     return (datetime.now(timezone.utc) - entry_dt).days >= max_days
 
 
+def _lotto_stop_loss_hit(pos: dict, mid: float) -> bool:
+    """Entry-anchored (not peak-anchored) hard stop -- checked continuously, any time of day."""
+    entry = pos.get("entry_price")
+    if not entry:
+        return False
+    return mid <= entry * (1 - cfg.LOTTO_STOP_LOSS_PCT)
+
+
+def _lotto_same_day_exit_hit(pos: dict) -> bool:
+    """True once we're on the same UTC calendar date as entry (== the ET trading day, since the
+    whole session falls within one UTC date). Paired with near_market_close() by the caller."""
+    if not cfg.LOTTO_SAME_DAY_EXIT:
+        return False
+    entry_dt = pos.get("entry_dt")
+    if not entry_dt:
+        return False
+    return entry_dt.date() == datetime.now(timezone.utc).date()
+
+
 def _at_position_cap(strategy: str) -> bool:
     """MAX_OPEN_POSITIONS with a reserved PEAD sub-cap (same pattern as v1, smaller numbers)."""
     if strategy == "pead":
@@ -186,11 +200,16 @@ def _write_bot_state():
     state = {}
     for symbol, pos in _monitored_positions.items():
         asset_type = pos.get("asset_type", "option")
+        strategy = pos.get("strategy", "news_call")
         entry = pos["entry_price"]
-        gain  = (pos["peak_price"] / entry - 1.0) if entry else 0.0
-        trail = long_trail_for(pos.get("strategy", "news_call"), asset_type, gain)
+        if strategy == "lotto":
+            stop_price = entry * (1 - cfg.LOTTO_STOP_LOSS_PCT)
+        else:
+            gain  = (pos["peak_price"] / entry - 1.0) if entry else 0.0
+            trail = long_trail_for(strategy, asset_type, gain)
+            stop_price = pos["peak_price"] * (1 - trail)
         state[symbol] = {
-            "stop_price":  round(pos["peak_price"] * (1 - trail), 4),
+            "stop_price":  round(stop_price, 4),
             "peak_price":  pos["peak_price"],
             "entry_price": entry,
             "asset_type":  asset_type,

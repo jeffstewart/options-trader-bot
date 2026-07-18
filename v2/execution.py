@@ -440,6 +440,71 @@ async def trailing_stop_monitor():
 
             entry, qty = pos["entry_price"], pos["qty"]
 
+            if strategy == "lotto" and asset_type == "option":
+                # Lotto exit rule (research/lotto_intraday_exit_test.py, 2026-07-17): entry-anchored
+                # stop-loss + forced same-day EOD exit, replacing peak-trailing entirely for this leg.
+                pnl_usd = (mid - entry) * 100 * qty
+                pnl_pct = ((mid - entry) / entry * 100) if entry > 0 else 0
+                stop_price = entry * (1 - cfg.LOTTO_STOP_LOSS_PCT) if entry else 0.0
+                log.info("👁  %-24s entry=$%.4f mid=$%.4f stop=$%.4f P&L %+.1f%% [lotto]",
+                         symbol, entry, mid, stop_price, pnl_pct)
+                mkt._write_bot_state()
+
+                # Hard profit cap (asymmetric-safe: only ever exits a WINNER early, never adds a loss).
+                if (cfg.LOTTO_HARD_CAP_ENABLED and entry > 0 and mid >= cfg.LOTTO_HARD_CAP_MULT * entry):
+                    if not mkt.market_is_open():
+                        mkt._log_deferred_once(symbol, "⏳ %s lotto cap hit but market closed — deferring")
+                        continue
+                    ok, fill = close_option_position(symbol, qty, reason=f"lotto {cfg.LOTTO_HARD_CAP_MULT:.0f}x cap")
+                    if not ok:
+                        continue
+                    exit_px = fill if fill is not None else mid
+                    pnl_usd = _realized_pnl(asset_type, entry, exit_px, qty)
+                    log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="lotto_cap")
+                    del mkt._monitored_positions[symbol]
+                    continue
+
+                if mkt._lotto_stop_loss_hit(pos, mid):
+                    if not mkt.market_is_open():
+                        mkt._log_deferred_once(symbol, "⏳ %s lotto stop-loss hit but market closed — deferring")
+                        continue
+                    ok, fill = close_option_position(symbol, qty, reason="lotto stop-loss")
+                    if not ok:
+                        log.warning("⏳ Close not confirmed for %s — keeping monitored, will retry", symbol)
+                        continue
+                    exit_px = fill if fill is not None else mid
+                    pnl_usd = _realized_pnl(asset_type, entry, exit_px, qty)
+                    log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="lotto_stop_loss")
+                    if pnl_usd < 0:
+                        mkt._daily_loss_usd += abs(pnl_usd)
+                    del mkt._monitored_positions[symbol]
+                    continue
+
+                if mkt._lotto_same_day_exit_hit(pos) and mkt.near_market_close():
+                    ok, fill = close_option_position(symbol, qty, reason="lotto same-day exit")
+                    if ok:
+                        exit_px = fill if fill is not None else mid
+                        pnl_usd = _realized_pnl(asset_type, entry, exit_px, qty)
+                        log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="lotto_eod")
+                        if pnl_usd < 0:
+                            mkt._daily_loss_usd += abs(pnl_usd)
+                        del mkt._monitored_positions[symbol]
+                    continue
+
+                # Fallback safety net: shouldn't normally fire since same-day exit fires first.
+                if mkt._time_stop_hit(pos) and mkt.near_market_close():
+                    ok, fill = close_option_position(symbol, qty, reason="time-stop")
+                    if ok:
+                        exit_px = fill if fill is not None else mid
+                        pnl_usd = _realized_pnl(asset_type, entry, exit_px, qty)
+                        log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="time-stop")
+                        if pnl_usd < 0:
+                            mkt._daily_loss_usd += abs(pnl_usd)
+                        del mkt._monitored_positions[symbol]
+                    continue
+
+                continue
+
             # Time-stop: exit at end-of-day on the final hold day (avoid the overnight gap).
             if mkt._time_stop_hit(pos) and mkt.near_market_close():
                 if asset_type == "stock":
@@ -472,21 +537,6 @@ async def trailing_stop_monitor():
             log.info("👁  %-24s entry=$%.4f mid=$%.4f peak=$%.4f stop=$%.4f P&L %+.1f%% [%s]",
                      symbol, entry, mid, peak, stop_price, pnl_pct, strategy)
             mkt._write_bot_state()
-
-            # LOTTO hard profit cap (asymmetric-safe: only ever exits a WINNER early, never adds a loss).
-            if (cfg.LOTTO_HARD_CAP_ENABLED and strategy == "lotto" and asset_type == "option"
-                    and entry > 0 and mid >= cfg.LOTTO_HARD_CAP_MULT * entry):
-                if not mkt.market_is_open():
-                    mkt._log_deferred_once(symbol, "⏳ %s lotto cap hit but market closed — deferring")
-                    continue
-                ok, fill = close_option_position(symbol, qty, reason=f"lotto {cfg.LOTTO_HARD_CAP_MULT:.0f}x cap")
-                if not ok:
-                    continue
-                exit_px = fill if fill is not None else mid
-                pnl_usd = _realized_pnl(asset_type, entry, exit_px, qty)
-                log_closed_trade(symbol, pos, exit_px, pnl_usd, reason="lotto_cap")
-                del mkt._monitored_positions[symbol]
-                continue
 
             if mid <= stop_price:
                 if not mkt.market_is_open():
