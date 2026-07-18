@@ -26,6 +26,7 @@ from typing import Optional
 
 import aiohttp
 import feedparser
+import sec_edgar
 from openai import OpenAI, RateLimitError
 from alpaca.data.live import NewsDataStream, StockDataStream
 from alpaca.data.historical.option import OptionHistoricalDataClient
@@ -2407,6 +2408,12 @@ async def trailing_stop_monitor():
 # The `catalyst` field is kept for telemetry but is VESTIGIAL for routing (collinear
 # with magnitude). KEEP THIS TEXT CHAR-EXACT IN SYNC with prompt_lab.PROMPTS["unified_v1"]
 # — the eval that validated it scored against that exact string.
+# Body truncation for all scorer calls below. Bumped from 1200 -> 2000 (2026-07-18) to fit the
+# SEC EDGAR fix's real filing/press-release text (previously only ever RSS Item-code summaries,
+# which fit comfortably in 1200) -- Alpaca/NewsAPI bodies are short blurbs well under either limit,
+# so this only meaningfully changes what SEC-sourced signals see.
+SCORE_BODY_CHARS = 2000
+
 SYSTEM_PROMPT = """You are a quantitative equity trading signal generator.
 Respond with a JSON object ONLY — no markdown, no code fences, no explanation.
 
@@ -2459,7 +2466,7 @@ def score_with_ollama(headline: str, body: str, source: str = "") -> Optional[di
             model=OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:1200]}\n\nRespond with JSON only."},
+                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\nRespond with JSON only."},
             ],
             temperature=0.1,
         )
@@ -2492,7 +2499,7 @@ def _score_with_groq_timed(headline: str, body: str, source: str, model: str = N
             model=model or GROQ_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:1200]}\n\nRespond with JSON only."},
+                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\nRespond with JSON only."},
             ],
             temperature=0.1,
         )
@@ -2600,7 +2607,7 @@ def _score_with_gemini(headline: str, body: str, source: str):
             model=GEMINI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:1200]}\n\nRespond with JSON only."},
+                {"role": "user",   "content": f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\nRespond with JSON only."},
             ],
             temperature=0.1,
         )
@@ -2773,7 +2780,7 @@ def score_materiality(headline: str, body: str) -> Optional[float]:
             model=OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": MATERIALITY_PROMPT},
-                {"role": "user",   "content": f"Headline: {headline}\n\nBody: {body[:1200]}\n\nJSON only."},
+                {"role": "user",   "content": f"Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\nJSON only."},
             ],
             temperature=0.1,
         )
@@ -3232,22 +3239,50 @@ async def handle_alpaca_news(news):
 # ── 2. SEC EDGAR 8-K RSS (poll) ───────────────────────────────────────────────
 
 async def sec_rss_poller():
+    """Was scoring only the RSS filer-index title ("8-K - CompanyName (CIK) (Filer)") -- no
+    ticker, no real disclosure text (see sec_edgar.py docstring / project_news_source_quality
+    memory: 99.7% of signals never resolved to a ticker). Now resolves CIK -> ticker
+    deterministically and, for a curated set of material Item codes, fetches the actual primary
+    8-K document + press-release exhibit so the model has real content instead of just Item
+    numbers."""
     log.info("📡 SEC EDGAR 8-K RSS poller started (every %ds)", SEC_POLL_SECS)
-    while True:
-        try:
-            feed = feedparser.parse(SEC_RSS_URL, agent=SEC_USER_AGENT)
-            for entry in feed.entries:
-                eid = entry.get("id", entry.get("link", ""))
-                if eid in _seen_news_ids:
-                    continue
-                _seen_news_ids.add(eid)
-                title   = entry.get("title", "")
-                summary = entry.get("summary", "")
-                log.info("📰 [SEC 8-K] %s", title[:100])
-                await process_signal(title, summary, "SEC EDGAR 8-K")
-        except Exception as e:
-            log.warning("SEC RSS poll error: %s", e)
-        await asyncio.sleep(SEC_POLL_SECS)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(SEC_RSS_URL, headers={"User-Agent": SEC_USER_AGENT},
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    raw = await r.text()
+                feed = feedparser.parse(raw)
+                cik_map = await sec_edgar.load_cik_ticker_map(session, SEC_USER_AGENT)
+
+                for entry in feed.entries:
+                    eid = entry.get("id", entry.get("link", ""))
+                    if eid in _seen_news_ids:
+                        continue
+                    _seen_news_ids.add(eid)
+                    title   = entry.get("title", "")
+                    summary = entry.get("summary", "")
+                    link    = entry.get("link", "")
+
+                    cik, accession = sec_edgar.extract_cik_accession(link)
+                    ticker = cik_map.get(cik) if cik else None
+
+                    headline = f"{title} [{ticker}]" if ticker else title
+                    body = summary
+                    if cik and accession and sec_edgar.item_codes_in_summary(summary) & sec_edgar.MATERIAL_ITEMS:
+                        try:
+                            full_text = await sec_edgar.fetch_8k_content(session, cik, accession, SEC_USER_AGENT)
+                        except Exception as e:
+                            log.debug("SEC 8-K content fetch failed for %s: %s", eid, e)
+                            full_text = ""
+                        if full_text:
+                            body = f"{summary}\n\n{full_text}"
+
+                    log.info("📰 [SEC 8-K] %s", headline[:100])
+                    await process_signal(headline, body, "SEC EDGAR 8-K")
+            except Exception as e:
+                log.warning("SEC RSS poll error: %s", e)
+            await asyncio.sleep(SEC_POLL_SECS)
 
 # ── 3. NewsAPI (poll) ─────────────────────────────────────────────────────────
 

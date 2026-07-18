@@ -73,6 +73,12 @@ Rules:
 - Return ONLY the JSON object."""
 
 
+# Bumped from 1200 -> 2000 (2026-07-18) to fit the SEC EDGAR fix's real filing/press-release text
+# (previously just an empty body) -- Alpaca/NewsAPI bodies are short blurbs well under either
+# limit, so this only meaningfully changes what SEC-sourced signals see.
+SCORE_BODY_CHARS = 2000
+
+
 def score_article(headline: str, body: str, source: str = "") -> "dict | None":
     prefix = f"[Source: {source}]\n" if source else ""
     try:
@@ -80,7 +86,7 @@ def score_article(headline: str, body: str, source: str = "") -> "dict | None":
             model=cfg.OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"{prefix}Headline: {headline}\n\nBody: {body[:1200]}\n\nRespond with JSON only."},
+                {"role": "user", "content": f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\nRespond with JSON only."},
             ],
             temperature=0.1,
         )

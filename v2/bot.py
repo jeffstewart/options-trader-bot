@@ -26,6 +26,7 @@ import logging
 import signal as os_signal
 from datetime import datetime, timezone
 
+import aiohttp
 import feedparser
 from alpaca.data.live import NewsDataStream
 
@@ -33,6 +34,7 @@ import config as cfg
 import market as mkt
 import execution as ex
 import scoring
+import sec_edgar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -157,21 +159,48 @@ async def handle_alpaca_news(news):
 
 
 async def sec_rss_poller():
+    """Was scoring the bare RSS filer-index title with an EMPTY body -- no ticker, no content at
+    all (see sec_edgar.py docstring / project_news_source_quality memory: 99.7% of SEC signals
+    never resolved to a ticker). Now resolves CIK -> ticker deterministically and, for a curated
+    set of material Item codes, fetches the actual primary 8-K document + press-release exhibit."""
     log.info("📡 SEC EDGAR 8-K RSS poller started (every %ds)", cfg.SEC_POLL_SECS)
-    while True:
-        try:
-            feed = feedparser.parse(cfg.SEC_RSS_URL, agent=cfg.SEC_USER_AGENT)
-            for entry in feed.entries:
-                eid = entry.get("id", entry.get("link", ""))
-                if eid in _seen_news_ids:
-                    continue
-                _seen_news_ids.add(eid)
-                headline = entry.get("title", "")
-                log.info("📰 [SEC 8-K] %s", headline[:100])
-                await process_signal(headline, "", "SEC 8-K")
-        except Exception as e:
-            log.warning("SEC RSS poll failed: %s", e)
-        await asyncio.sleep(cfg.SEC_POLL_SECS)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(cfg.SEC_RSS_URL, headers={"User-Agent": cfg.SEC_USER_AGENT},
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    raw = await r.text()
+                feed = feedparser.parse(raw)
+                cik_map = await sec_edgar.load_cik_ticker_map(session, cfg.SEC_USER_AGENT)
+
+                for entry in feed.entries:
+                    eid = entry.get("id", entry.get("link", ""))
+                    if eid in _seen_news_ids:
+                        continue
+                    _seen_news_ids.add(eid)
+                    title   = entry.get("title", "")
+                    summary = entry.get("summary", "")
+                    link    = entry.get("link", "")
+
+                    cik, accession = sec_edgar.extract_cik_accession(link)
+                    ticker = cik_map.get(cik) if cik else None
+
+                    headline = f"{title} [{ticker}]" if ticker else title
+                    body = summary
+                    if cik and accession and sec_edgar.item_codes_in_summary(summary) & sec_edgar.MATERIAL_ITEMS:
+                        try:
+                            full_text = await sec_edgar.fetch_8k_content(session, cik, accession, cfg.SEC_USER_AGENT)
+                        except Exception as e:
+                            log.debug("SEC 8-K content fetch failed for %s: %s", eid, e)
+                            full_text = ""
+                        if full_text:
+                            body = f"{summary}\n\n{full_text}"
+
+                    log.info("📰 [SEC 8-K] %s", headline[:100])
+                    await process_signal(headline, body, "SEC EDGAR 8-K")
+            except Exception as e:
+                log.warning("SEC RSS poll failed: %s", e)
+            await asyncio.sleep(cfg.SEC_POLL_SECS)
 
 
 async def _supervised(make_coro, name):

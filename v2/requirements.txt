@@ -1,7 +1,9 @@
 # v2 runtime dependencies — a deliberately smaller set than v1's (no Flask/dashboard, no
 # numpy/yfinance backtest deps; the live bot only needs these). Pinned to the same versions
 # as the working v1 venv for consistency.
+aiohttp==3.13.5
 alpaca-py==0.43.4
+beautifulsoup4==4.14.3
 feedparser==6.0.12
 openai==2.38.0
 python-dotenv==1.2.2
