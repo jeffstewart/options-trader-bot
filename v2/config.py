@@ -164,6 +164,17 @@ LOTTO_HARD_CAP_MULT     = 3.0
 LOTTO_STOP_LOSS_PCT     = 0.20   # hard stop anchored to entry premium, checked continuously
 LOTTO_SAME_DAY_EXIT     = True   # force close at EOD of the entry day regardless of P&L
 LOTTO_MAX_HOLD_DAYS     = 3      # fallback safety net only -- same-day exit should always fire first
+# Entry cutoff (2026-07-18, research/lotto_entry_cutoff_test.py): since every lotto position gets
+# force-closed the SAME day regardless of P&L, a signal firing late in the session leaves almost
+# no runway for the stop-loss or any real move to matter before the forced exit -- pure spread
+# cost for no developed edge. Backtest (Ollama live-gate-adjacent signals, n=106 across buckets)
+# didn't show a clean monotonic "more runway = better" gradient -- lotto's convex few-big-winners
+# structure means most bucket averages (n=18-38) are noise-dominated. The one bucket that WAS
+# directionally consistent with the mechanical concern: 0.0-0.5h before close had both the worst
+# avg $ (-$18) and a below-average win rate (29%) of any populated bucket, while 0.5-1.0h (n=38)
+# was actually the strongest performer -- so the cutoff is deliberately small (doesn't touch the
+# well-performing 0.5-1.0h window) rather than an aggressive number the data doesn't support.
+LOTTO_ENTRY_CUTOFF_MIN_BEFORE_CLOSE = 30   # stop opening NEW lotto positions inside this window
 # Decided 2026-07-18 (equity-relative, not v1's fixed $250 -- scales automatically with account
 # growth, per jeff's ask: a well-performing bot should size up its bets as equity grows, rather
 # than needing a manual re-tune). 10% survives a realistic losing streak reasonably well: at the

@@ -166,3 +166,28 @@ def test_lotto_same_day_exit_requires_same_calendar_date(monkeypatch):
 
     monkeypatch.setattr(cfg, "LOTTO_SAME_DAY_EXIT", False)
     assert not mkt._lotto_same_day_exit_hit(pos_today)
+
+
+def test_lotto_entry_cutoff_blocks_new_positions_near_close(monkeypatch):
+    """research/lotto_entry_cutoff_test.py (2026-07-18): since every lotto position force-closes
+    the SAME day, a signal firing inside the cutoff window has almost no runway before the forced
+    exit -- pure spread cost for no developed edge. execute_lotto must skip opening a NEW position
+    (but this must never touch position management for already-open ones -- that's a separate
+    check in the monitor)."""
+    monkeypatch.setattr(mkt, "near_market_close", lambda within_min=0: True)
+    called = []
+    monkeypatch.setattr(ex, "place_option_trade", lambda *a, **k: called.append(1))
+    ex.execute_lotto("AAPL", {"magnitude": 0.9, "confidence": 0.9})
+    assert called == [], "must not open a new position inside the entry cutoff window"
+
+
+def test_lotto_entry_cutoff_allows_positions_with_enough_runway(monkeypatch):
+    monkeypatch.setattr(mkt, "near_market_close", lambda within_min=0: False)
+    monkeypatch.setattr(mkt, "_at_position_cap", lambda strategy: False)
+    monkeypatch.setattr(mkt, "get_stock_price", lambda tk: 100.0)
+    monkeypatch.setattr(mkt, "passes_stock_price_guardrail", lambda tk, px: True)
+    monkeypatch.setattr(mkt, "lotto_budget_usd", lambda: 100.0)
+    called = []
+    monkeypatch.setattr(ex, "place_option_trade", lambda *a, **k: called.append(1))
+    ex.execute_lotto("AAPL", {"magnitude": 0.9, "confidence": 0.9})
+    assert called == [1], "must still open a position when there's enough runway before close"

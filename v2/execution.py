@@ -290,6 +290,10 @@ def execute_news_call(ticker: str, signal: dict):
 
 
 def execute_lotto(ticker: str, signal: dict):
+    if mkt.near_market_close(within_min=cfg.LOTTO_ENTRY_CUTOFF_MIN_BEFORE_CLOSE):
+        log.info("  → %s: too close to the same-day forced exit (<%dmin left) — skipping new lotto entry",
+                 ticker, cfg.LOTTO_ENTRY_CUTOFF_MIN_BEFORE_CLOSE)
+        return
     if mkt._at_position_cap("lotto"):
         return
     if any(p.get("strategy") == "lotto" and p.get("underlying") == ticker
