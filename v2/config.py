@@ -127,7 +127,9 @@ MAX_CONTRACT_BUDGET_MULT = 1.15
 # with sonnet5 scoring. Revisit alongside the scorer-swap decision, not before.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-NEWS_CALL_ENABLED       = True
+NEWS_CALL_ENABLED       = False  # disabled 2026-07-18: no non-lottery Sharpe shape found at any
+                                  # threshold/scorer tested (small_account_news_call_sweep.py) --
+                                  # lotto alone is simpler and covers the same convex-bet niche.
 NEWS_CALL_MIN_MAGNITUDE = 0.75
 NEWS_CALL_DTE_MIN       = 7
 NEWS_CALL_DTE_MAX       = 13
@@ -166,6 +168,10 @@ LOTTO_POSITION_FRAC_OF_EQUITY = 0.10
 
 # PEAD -- stock leg only (matches what's currently live in v1; the ITM-options variant is still
 # being validated on v1's pead_option_shadow, not duplicated here).
+PEAD_ENABLED        = False  # disabled 2026-07-18: best win-rate shape found all session (53.9%,
+                              # small_account_lotto_pead_sweep.py) but too slow/capital-intensive
+                              # for this account -- ~11.7 concurrent positions needed (median hold
+                              # rides the full 10d cap), rejected on that basis, not signal quality.
 PEAD_EXIT_TIERS     = [(float("inf"), 0.20)]   # flat 20% trail
 PEAD_BREAKEVEN_LOCK = 0.0
 PEAD_MAX_HOLD_DAYS  = 10

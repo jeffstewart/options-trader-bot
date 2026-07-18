@@ -44,6 +44,7 @@ def test_ticker_corrector_overrides_primary_scorer_ticker(monkeypatch):
     monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
     monkeypatch.setattr(mkt, "on_cooldown", lambda tk: False)
     monkeypatch.setattr(ex, "log_regime_decision", lambda *a, **k: None)
+    monkeypatch.setattr(cfg, "NEWS_CALL_ENABLED", True)  # exercise the news_call dispatch path directly
     monkeypatch.setattr(scoring, "score_article", lambda h, b, s: {
         "tickers": ["MSFT"], "sentiment": "bullish", "confidence": 0.90,
         "magnitude": 0.85, "reasoning": "test",
@@ -65,6 +66,7 @@ def test_ticker_corrector_no_change_keeps_primary_ticker(monkeypatch):
     monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
     monkeypatch.setattr(mkt, "on_cooldown", lambda tk: False)
     monkeypatch.setattr(ex, "log_regime_decision", lambda *a, **k: None)
+    monkeypatch.setattr(cfg, "NEWS_CALL_ENABLED", True)  # exercise the news_call dispatch path directly
     monkeypatch.setattr(scoring, "score_article", lambda h, b, s: {
         "tickers": ["AAPL"], "sentiment": "bullish", "confidence": 0.90,
         "magnitude": 0.85, "reasoning": "test",
@@ -108,6 +110,17 @@ def test_no_pairs_or_bear_short_config_exists():
     assert not hasattr(cfg, "PAIRS_ENABLED")
     assert not hasattr(cfg, "BEAR_SHORT_ENABLED")
     assert not hasattr(cfg, "HYBRID_SCORER_ENABLED")   # confirm/veto gate must not reappear either
+
+
+def test_news_call_and_pead_disabled_by_default():
+    """Disabled 2026-07-18: news_call never found a non-lottery Sharpe shape at any threshold
+    (small_account_news_call_sweep.py), and PEAD -- despite the best win-rate shape found all
+    session, 53.9% -- needs ~11.7 concurrent positions in steady state
+    (small_account_lotto_pead_sweep.py), too capital-intensive for this account. Lotto alone is
+    the live leg for now; both flags stay in config as a one-line re-enable, not deleted."""
+    assert cfg.NEWS_CALL_ENABLED is False
+    assert cfg.PEAD_ENABLED is False
+    assert cfg.LOTTO_ENABLED is True
 
 
 def test_lotto_peak_trailing_tiers_removed():

@@ -117,7 +117,7 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
         except asyncio.TimeoutError:
             log.error("execute_news_call timed out for %s", ticker)
 
-    if ex._is_earnings_headline(headline):
+    if cfg.PEAD_ENABLED and ex._is_earnings_headline(headline):
         try:
             await asyncio.wait_for(loop.run_in_executor(None, ex.execute_pead, ticker, signal), timeout=30)
         except asyncio.TimeoutError:
