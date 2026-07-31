@@ -225,26 +225,50 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
              contract["symbol"], contract["strike"], contract["expiry"],
              contract["bid"], contract["ask"], contract["spread_pct"] * 100, qty)
 
+    # Marketable limit 10% above ask, confirmed-fill-or-cancel (ported from core/bot.py,
+    # 2026-07-22): a plain limit AT the ask can sit unfilled for minutes to hours if the market
+    # moves before it reaches the book -- root-caused on v1 from two live DAY orders that sat
+    # at Alpaca status=new, filled_qty=0 for 40+/several+ minutes while place_option_trade had
+    # ALREADY registered them in _monitored_positions/trades.csv as if filled, creating phantom
+    # "open" positions the dashboard and the bot's own dedup/cooldown logic both trusted. A
+    # marketable limit crosses the spread immediately in normal conditions -- historical
+    # fill-latency on the mirror-image exit design (close_option_position's bid*0.90) is median
+    # 0.07s / p95 0.25s (n=90) on this account, so 10s of headroom is generous, not tight.
+    # _await_fill_price confirms the ACTUAL fill before anything is logged/registered; a
+    # still-unfilled order after 10s means something is genuinely wrong (halt, no offers, stale
+    # quote) rather than normal latency, so it's cancelled and skipped instead of recorded.
+    marketable_limit = round(contract["ask"] * 1.10, 2)
+
     if cfg.DRY_RUN:
-        log.info("🧪 DRY RUN — would BUY %s x%d limit=$%.4f max_loss=$%.0f [%s] (no order submitted)",
-                 contract["symbol"], qty, contract["ask"], contract["ask"] * 100 * qty, strategy)
+        log.info("🧪 DRY RUN — would BUY %s x%d limit=$%.4f (marketable, ask was $%.4f) max_loss=$%.0f [%s] (no order submitted)",
+                 contract["symbol"], qty, marketable_limit, contract["ask"], marketable_limit * 100 * qty, strategy)
         return None
 
-    # Limit order at ask — avoids "no quote" rejection on market orders.
     req = LimitOrderRequest(symbol=contract["symbol"], qty=qty, side=OrderSide.BUY,
-                           time_in_force=TimeInForce.DAY, limit_price=round(contract["ask"], 2),
+                           time_in_force=TimeInForce.DAY, limit_price=marketable_limit,
                            position_intent=PositionIntent.BUY_TO_OPEN)
     try:
-        mkt.trading_client.submit_order(req)
-        log.info("✅ OPTION BUY  %s x%d  limit=$%.4f  max_loss=$%.0f",
-                 contract["symbol"], qty, contract["ask"], contract["ask"] * 100 * qty)
+        order = mkt.trading_client.submit_order(req)
     except Exception as e:
         log.error("Option buy failed: %s", e)
         return None
 
+    fill = _await_fill_price(order, timeout_s=10.0)
+    if fill is None:
+        try:
+            mkt.trading_client.cancel_order_by_id(order.id)
+        except Exception as ce:
+            log.warning("Could not cancel unfilled buy order %s: %s", order.id, ce)
+        log.warning("  → %s buy did not fill within 10s (limit=$%.4f vs ask $%.4f at decision time) "
+                    "— cancelled, skipping [%s]", contract["symbol"], marketable_limit, contract["ask"], strategy)
+        return None
+
+    log.info("✅ OPTION BUY  %s x%d  fill=$%.4f  limit=$%.4f  max_loss=$%.0f",
+             contract["symbol"], qty, fill, marketable_limit, fill * 100 * qty)
+
     # No exchange-held stop (account can't hold uncovered option sell-stops) — the in-process
     # monitor is the sole protection, exactly as on v1.
-    entry = contract["ask"]
+    entry = fill
     mkt._monitored_positions[contract["symbol"]] = {
         "qty": qty, "entry_price": entry, "peak_price": entry, "underlying": ticker,
         "asset_type": "option", "strategy": strategy, "entry_dt": datetime.now(timezone.utc),
@@ -471,6 +495,39 @@ def log_trade_stock(ticker, shares, entry_price, signal, strategy):
                    signal.get("_ticker_corrected", ""), signal.get("_source", "")])
 
 
+
+def _log_position_path(symbol: str, pos: dict, mid: float, pnl_pct: float, stop_price) -> None:
+    """Append one monitor-cycle sample of a position's real premium path to position_paths.csv.
+
+    Ported from v1 (core/bot.py) 2026-07-31. The monitor already fetches a REAL option mid every
+    ~30s -- this just persists it. Without it, the only record of a position's path was the
+    `👁` log lines, which meant reconstructing the 2026-07-31 AMZN trade by regexing 203 lines out
+    of bot.log, and which vanish on log rotation.
+
+    This is what lets research/exit_path_replay.py judge exit rules on REAL quotes instead of the
+    Black-Scholes approximations in lotto_intraday_exit_test.py -- the same upgrade that settled
+    the TP@+25% question for news_call at n=54 after the simulated sweeps disagreed.
+
+    v1 also samples for a while AFTER exiting (phase='postclose') so a replay can ask "would
+    holding longer have won?". Not ported: lotto force-closes same-day, so the post-exit window is
+    short and the question is far less interesting here. Add it if that changes.
+    """
+    try:
+        new = not os.path.exists("position_paths.csv")
+        with open("position_paths.csv", "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["ts", "symbol", "strategy", "asset_type", "underlying",
+                            "entry", "mid", "peak", "pnl_pct", "stop", "phase"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), symbol, pos.get("strategy", ""),
+                        pos.get("asset_type", ""), pos.get("underlying", ""),
+                        pos.get("entry_price", ""), round(mid, 4),
+                        pos.get("peak_price") or pos.get("entry_price", ""),
+                        round(pnl_pct, 2), round(stop_price, 4) if stop_price else "", "open"])
+    except Exception as e:                      # telemetry must never break the monitor
+        log.debug("position-path log failed for %s: %s", symbol, e)
+
+
 def log_closed_trade(symbol: str, pos: dict, exit_price: float, pnl_usd: float, reason: str = "stop"):
     write_header = not os.path.exists(mkt.CLOSED_TRADES_FILE)
     asset_type = pos.get("asset_type", "option")
@@ -542,11 +599,18 @@ async def trailing_stop_monitor():
             if strategy == "lotto" and asset_type == "option":
                 # Lotto exit rule (research/lotto_intraday_exit_test.py, 2026-07-17): entry-anchored
                 # stop-loss + forced same-day EOD exit, replacing peak-trailing entirely for this leg.
+                # Track the peak BEFORE computing the stop: the ratchet reads peak_price, and this
+                # branch previously never updated it -- so closed_trades.csv recorded the entry as
+                # the peak (AMZN 2026-07-31 logged peak_price=0.8400 against a real peak of
+                # $1.0950) and no peak-based rule could have worked even if one existed.
+                if mid > pos.get("peak_price", entry):
+                    pos["peak_price"] = mid
                 pnl_usd = (mid - entry) * 100 * qty
                 pnl_pct = ((mid - entry) / entry * 100) if entry > 0 else 0
-                stop_price = entry * (1 - cfg.LOTTO_STOP_LOSS_PCT) if entry else 0.0
+                stop_price = mkt.lotto_stop_price(pos)
                 log.info("👁  %-24s entry=$%.4f mid=$%.4f stop=$%.4f P&L %+.1f%% [lotto]",
                          symbol, entry, mid, stop_price, pnl_pct)
+                _log_position_path(symbol, pos, mid, pnl_pct, stop_price)
                 mkt._write_bot_state()
 
                 # Hard profit cap (asymmetric-safe: only ever exits a WINNER early, never adds a loss).

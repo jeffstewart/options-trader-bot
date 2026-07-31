@@ -27,6 +27,7 @@ from typing import Optional
 import aiohttp
 import feedparser
 import numpy as np
+import requests
 import sec_edgar
 from openai import OpenAI, RateLimitError
 from pricing import implied_vol_call
@@ -120,6 +121,16 @@ DAILY_LOSS_LIMIT_PCT: float = 0.02   # halt new trades once a day's realized los
 
 # symbol → {qty, entry_price, peak_price, underlying, asset_type}
 _monitored_positions: dict[str, dict] = {}
+
+# Option symbols whose post-entry trend has already been logged (or attempted) --
+# trailing_stop_monitor sets this the first cycle it fires the delayed trend fetch, so a
+# position sitting open for hours doesn't re-fetch every 30s. See _log_delayed_option_trend.
+_trend_logged: set[str] = set()
+
+# Option symbols whose first post-entry quote has already been captured -- see
+# _log_entry_quote_drift. Separate from _trend_logged: this one fires on the FIRST monitor
+# cycle after entry (real quote data, no OPRA wait needed), not 17 minutes later.
+_entry_quote_logged: set[str] = set()
 
 # SHADOW positions — paper-only (NO orders, NO capital). Used to track what a DISABLED
 # strategy (currently news_call) WOULD do, so we accumulate forward data risk-free.
@@ -421,6 +432,84 @@ def near_market_close(within_min: int = TIME_STOP_EOD_WINDOW_MIN) -> bool:
 # Regime cache: the 200-day SMA barely moves intraday, so compute once per day.
 _regime_cache: dict = {"date": None, "uptrend": True}
 
+def _downday_detail(bars, dd_win: int, dd_max: float):
+    """Per-session up/down sequence for the chop window, plus a best-case estimate of how many
+    more sessions must pass before the down-day density can clear.
+
+    WHY THE SEQUENCE AND NOT JUST THE COUNT (jeff, 2026-07-30): the density is a rolling window, so
+    WHEN the down days sit determines when the gate can reopen. 7 down days bunched at the OLD end
+    roll off within a couple of sessions; the same 7 at the NEW end mean a long wait. The count
+    alone cannot distinguish those two, and it is the difference between "maybe trades tomorrow"
+    and "definitely nothing this week".
+
+    `sessions_to_clear` assumes EVERY future session closes up -- it is a floor ("at least this
+    many"), never a forecast. Returns 0 when the chop test already passes.
+    """
+    if dd_win <= 0 or len(bars) <= dd_win:
+        return [], 0
+    window = bars[-dd_win - 1:]                       # dd_win+1 bars -> dd_win comparisons
+    days = []
+    for prev, cur in zip(window[:-1], window[1:]):
+        ts = getattr(cur, "timestamp", None)
+        days.append({"date": ts.strftime("%Y-%m-%d") if ts else "",
+                     "down": float(cur.close) < float(prev.close),
+                     "pct": round((float(cur.close) / float(prev.close) - 1) * 100, 2)})
+    limit = dd_max * dd_win                           # density < dd_max  <=>  count < limit
+    downs = [d["down"] for d in days]
+    sessions = next((k for k in range(dd_win + 1) if sum(downs[k:]) < limit), dd_win)
+    return days, sessions
+
+
+def regime_status() -> dict:
+    """Live regime computation with the full diagnostic breakdown (price, SMA, momentum, chop),
+    not just the pass/fail bool -- factored out of market_in_uptrend() (2026-07-20, mirroring
+    the same split done in v2/market.py) so the dashboard can call the exact same math for
+    display without duplicating it and risking drift. No caching, no logging, no side effects --
+    safe to call from a read-only process on every page load."""
+    if not REGIME_FILTER_ENABLED:
+        return {"enabled": False, "uptrend": True}
+    try:
+        start = datetime.now(timezone.utc) - timedelta(days=int(REGIME_MA_DAYS * 1.6) + 30)
+        resp = stock_data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
+        _regime_bars = (resp.data or {}).get(REGIME_INDEX, [])
+        closes = [float(b.close) for b in _regime_bars]
+        if len(closes) < REGIME_MA_DAYS:
+            return {"enabled": True, "uptrend": True, "insufficient_data": True,
+                    "bars": len(closes), "bars_needed": REGIME_MA_DAYS}
+
+        sma = sum(closes[-REGIME_MA_DAYS:]) / REGIME_MA_DAYS
+        price = closes[-1]
+        above_sma = price >= sma
+
+        mom_days = REGIME_MOMENTUM_DAYS
+        has_mom = mom_days > 0 and len(closes) > mom_days
+        mom_price_then = closes[-1 - mom_days] if has_mom else None
+        mom_ok = mom_days <= 0 or not has_mom or price >= mom_price_then
+
+        dd_win = REGIME_DOWNDAY_WINDOW
+        if dd_win > 0 and len(closes) > dd_win:
+            dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
+                              if b < a) / dd_win
+        else:
+            dd_density = 0.0
+        chop_ok = dd_win <= 0 or dd_density < REGIME_DOWNDAY_MAX_DENSITY
+        dd_days, dd_to_clear = _downday_detail(_regime_bars, dd_win, REGIME_DOWNDAY_MAX_DENSITY)
+
+        return {
+            "enabled": True, "uptrend": above_sma and mom_ok and chop_ok,
+            "index": REGIME_INDEX, "price": price,
+            "sma": round(sma, 2), "sma_days": REGIME_MA_DAYS, "above_sma": above_sma,
+            "mom_ok": mom_ok, "mom_days": mom_days, "mom_price_then": mom_price_then,
+            "dd_density": round(dd_density, 4), "dd_window": dd_win,
+            "dd_days": dd_days, "dd_sessions_to_clear": dd_to_clear,
+            "dd_max": REGIME_DOWNDAY_MAX_DENSITY, "chop_ok": chop_ok,
+            "bypass_min_magnitude": REGIME_BYPASS_MIN_MAGNITUDE,
+        }
+    except Exception as e:
+        return {"enabled": True, "uptrend": True, "error": str(e)}
+
+
 def market_in_uptrend() -> bool:
     """
     True if the index (SPY) is above its REGIME_MA_DAYS-day SMA. Long calls are
@@ -433,44 +522,21 @@ def market_in_uptrend() -> bool:
     today = date.today()
     if _regime_cache["date"] == today:
         return _regime_cache["uptrend"]
-    try:
-        start = datetime.now(timezone.utc) - timedelta(days=int(REGIME_MA_DAYS * 1.6) + 30)
-        resp = stock_data_client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
-        bars = (resp.data or {}).get(REGIME_INDEX, [])
-        closes = [float(b.close) for b in bars]
-        if len(closes) < REGIME_MA_DAYS:
-            log.warning("Regime: only %d bars for %s (<%d) — defaulting to uptrend",
-                        len(closes), REGIME_INDEX, REGIME_MA_DAYS)
-            up = True
-        else:
-            sma = sum(closes[-REGIME_MA_DAYS:]) / REGIME_MA_DAYS
-            above_sma = closes[-1] >= sma
-            # Short-term momentum brake: SPY today must also be ≥ SPY REGIME_MOMENTUM_DAYS trading
-            # days ago — pauses the long legs during multi-day pullbacks the slow 200d misses.
-            mom_ok = (REGIME_MOMENTUM_DAYS <= 0 or len(closes) <= REGIME_MOMENTUM_DAYS
-                      or closes[-1] >= closes[-1 - REGIME_MOMENTUM_DAYS])
-            # Chop brake: too many down closes in the recent window = no follow-through for the
-            # 3-day call trades, even when level (200d) and sign (momentum) both look fine.
-            dd_win = REGIME_DOWNDAY_WINDOW
-            if dd_win > 0 and len(closes) > dd_win:
-                dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
-                                 if b < a) / dd_win
-            else:
-                dd_density = 0.0
-            chop_ok = dd_win <= 0 or dd_density < REGIME_DOWNDAY_MAX_DENSITY
-            up = above_sma and mom_ok and chop_ok
-            ret_nd = (closes[-1] / closes[-1 - REGIME_MOMENTUM_DAYS] - 1) * 100 if (
-                REGIME_MOMENTUM_DAYS > 0 and len(closes) > REGIME_MOMENTUM_DAYS) else 0.0
-            log.info("📐 Regime: %s last=$%.2f vs %dd SMA=$%.2f (%s) · %dd mom %+.1f%% (%s) · "
-                     "%dd down-days %.0f%% (%s) → %s",
-                     REGIME_INDEX, closes[-1], REGIME_MA_DAYS, sma,
-                     "above" if above_sma else "below", REGIME_MOMENTUM_DAYS, ret_nd,
-                     "ok" if mom_ok else "down", dd_win, dd_density * 100,
-                     "ok" if chop_ok else "choppy", "UPTREND (trading)" if up else "PAUSED (calls off)")
-    except Exception as e:
-        log.warning("Regime check failed (%s) — defaulting to uptrend", e)
-        up = True
+    st = regime_status()
+    up = st.get("uptrend", True)
+    if st.get("error"):
+        log.warning("Regime check failed (%s) — defaulting to uptrend", st["error"])
+    elif st.get("insufficient_data"):
+        log.warning("Regime: only %d bars for %s (<%d) — defaulting to uptrend",
+                    st["bars"], REGIME_INDEX, st["bars_needed"])
+    else:
+        ret_nd = (st["price"] / st["mom_price_then"] - 1) * 100 if st["mom_price_then"] else 0.0
+        log.info("📐 Regime: %s last=$%.2f vs %dd SMA=$%.2f (%s) · %dd mom %+.1f%% (%s) · "
+                 "%dd down-days %.0f%% (%s) → %s",
+                 st["index"], st["price"], st["sma_days"], st["sma"],
+                 "above" if st["above_sma"] else "below", st["mom_days"], ret_nd,
+                 "ok" if st["mom_ok"] else "down", st["dd_window"], st["dd_density"] * 100,
+                 "ok" if st["chop_ok"] else "choppy", "UPTREND (trading)" if up else "PAUSED (calls off)")
     _regime_cache.update(date=today, uptrend=up)
     return up
 
@@ -531,11 +597,33 @@ def get_option_quote(symbol: str) -> Optional[dict]:
         return None
 
 def get_option_greeks(symbol: str) -> Optional[dict]:
-    """Real delta/IV/greeks from Alpaca's option snapshot. None on failure."""
+    """Real delta/IV/greeks from Alpaca's option snapshot. None on failure.
+
+    Also pulls the snapshot's latest_trade/latest_quote (2026-07-23, research telemetry --
+    zero extra API calls, same snapshot response this function already fetched for greeks/IV):
+    trade_vs_spread classifies the last print via the standard quote-rule -- where it fell
+    within the contemporaneous bid/ask, 0.0 = printed at the bid (seller-initiated), 1.0 =
+    printed at the ask (buyer-initiated), 0.5 = at the midpoint. This is a DIFFERENT signal
+    from the price-trend research (contract_trend.csv / stock_trend.csv): it's about which
+    side was aggressive on the last trade, not where price has been moving over time.
+    last_trade_age_s matters for interpreting it -- a print from 0.5s ago says a lot more
+    than one from 5 minutes ago on a thin contract."""
     try:
         snap = option_data_client.get_option_snapshot(OptionSnapshotRequest(symbol_or_symbols=symbol))
         s = snap[symbol]
         g = getattr(s, "greeks", None)
+        lt = getattr(s, "latest_trade", None)
+        lq = getattr(s, "latest_quote", None)
+        trade_price = getattr(lt, "price", None) if lt else None
+        bid = getattr(lq, "bid_price", None) if lq else None
+        ask = getattr(lq, "ask_price", None) if lq else None
+        trade_vs_spread = None
+        if trade_price is not None and bid is not None and ask is not None and ask > bid:
+            trade_vs_spread = (trade_price - bid) / (ask - bid)
+        trade_age_s = None
+        lt_ts = getattr(lt, "timestamp", None) if lt else None
+        if lt_ts:
+            trade_age_s = (datetime.now(timezone.utc) - lt_ts).total_seconds()
         return {
             "delta": getattr(g, "delta", None) if g else None,
             "gamma": getattr(g, "gamma", None) if g else None,
@@ -543,10 +631,120 @@ def get_option_greeks(symbol: str) -> Optional[dict]:
             "vega":  getattr(g, "vega", None) if g else None,
             "rho":   getattr(g, "rho", None) if g else None,
             "iv":    getattr(s, "implied_volatility", None),
+            "last_trade_price": trade_price,
+            "last_trade_size":  getattr(lt, "size", None) if lt else None,
+            "last_trade_age_s": trade_age_s,
+            "snap_bid": bid,
+            "snap_ask": ask,
+            "trade_vs_spread": trade_vs_spread,
         }
     except Exception as e:
         log.debug("Option greeks fetch failed for %s: %s", symbol, e)
         return None
+
+TREND_LOOKBACK_MIN = 15
+# Real-time (<15min old) option BARS 403 with "OPRA agreement is not signed" -- confirmed
+# empirically 2026-07-22 (0/5/10min old: 403; 15min+: 200). Only delayed data is free on this
+# plan. TREND_DELAY_MIN must clear that boundary with margin, not sit right on it.
+TREND_DELAY_MIN = 17
+
+
+def _option_recent_trend(symbol: str, end_dt: datetime, lookback_min: int = TREND_LOOKBACK_MIN,
+                         timeout_s: float = 5.0) -> dict:
+    """Option TRADE-price trend in the lookback_min BEFORE end_dt (2026-07-22) -- prospective
+    version of the ad-hoc retrospective analysis done the same day (which found instant-fill
+    trades win 10% vs 26%+ for slower fills, but couldn't cleanly test "was the price already
+    falling at decision time" from historical data: NBBO quote history 404s on this data plan,
+    forcing a reconstruction from sparse 1min trade bars). Logs the same trade-bar-based trend
+    going forward so there's a clean, purpose-built dataset instead of a post-hoc one.
+    end_dt is the caller's choice, NOT "now" -- see _log_delayed_option_trend for why: real-time
+    (<15min old) option bars 403 on this data plan ("OPRA agreement is not signed"), so this can
+    only be called once end_dt is far enough in the past for the request to land in the free,
+    delayed window.
+    window_trend_pct: % change from the earliest to latest bar close in the lookback window.
+    recent_trend_pct: % change between the last two bars (closest to end_dt).
+    None values mean too few trades printed in the window to compute a trend (common on
+    thin names) -- NOT an error. Research-only: never blocks or gates any trade. Explicit
+    timeout because alpaca-py's own REST clients set none by default (see v2/market.py's
+    patch_request_timeout for the incident this guards against) -- this call bypasses
+    option_data_client entirely, so it needs its own."""
+    try:
+        start = end_dt - timedelta(minutes=lookback_min)
+        r = requests.get(
+            "https://data.alpaca.markets/v1beta1/options/bars",
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            params={"symbols": symbol, "timeframe": "1Min",
+                    "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 50},
+            timeout=timeout_s,
+        )
+        bars = sorted((r.json().get("bars") or {}).get(symbol, []), key=lambda b: b["t"])
+    except Exception as e:
+        log.debug("option trend fetch failed for %s: %s", symbol, e)
+        return {"n_bars": 0, "window_trend_pct": None, "recent_trend_pct": None}
+
+    if len(bars) < 2:
+        return {"n_bars": len(bars), "window_trend_pct": None, "recent_trend_pct": None}
+
+    first_c, last_c, prev_c = bars[0]["c"], bars[-1]["c"], bars[-2]["c"]
+    window_trend = (last_c - first_c) / first_c * 100 if first_c else None
+    recent_trend = (last_c - prev_c) / prev_c * 100 if prev_c else None
+    return {"n_bars": len(bars), "window_trend_pct": window_trend, "recent_trend_pct": recent_trend}
+
+
+def _log_delayed_option_trend(symbol: str, entry_dt: datetime, strategy: str):
+    """Called once per option position, TREND_DELAY_MIN after entry (from
+    trailing_stop_monitor, off the event loop) -- fetches the trend leading into the entry and
+    appends it to contract_trend.csv, keyed by symbol so it joins to trades.csv/
+    closed_trades.csv/contract_selection.csv later. Separate file (not a contract_selection.csv
+    column) because this data literally cannot exist until ~17min after the trade, whereas
+    everything else in that file is logged synchronously at entry."""
+    trend = _option_recent_trend(symbol, entry_dt)
+    try:
+        path = "contract_trend.csv"
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["logged_at", "symbol", "strategy", "entry_dt",
+                            "trend_n_bars", "trend_window_pct", "trend_recent_pct"])
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(), symbol, strategy, entry_dt.isoformat(),
+                trend["n_bars"],
+                f"{trend['window_trend_pct']:.4f}" if trend["window_trend_pct"] is not None else "",
+                f"{trend['recent_trend_pct']:.4f}" if trend["recent_trend_pct"] is not None else "",
+            ])
+    except Exception as e:
+        log.debug("delayed trend log failed for %s: %s", symbol, e)
+
+
+def _log_entry_quote_drift(symbol: str, strategy: str, entry_price: float, entry_dt: datetime,
+                           quote: dict):
+    """Entry-to-first-post-entry-quote drift (2026-07-22) -- a much faster, quote-based
+    (real bid/ask, not trade-price) complement to _log_delayed_option_trend: instead of
+    waiting/polling an extra time inside the entry path (which would slow down every trade
+    just to measure this), piggyback on trailing_stop_monitor's ALREADY-SCHEDULED first
+    post-entry get_option_quote() call. seconds_since_entry varies trade to trade (whatever the
+    monitor's 30s cycle happens to land on relative to entry) -- logged explicitly so analysis
+    isn't assuming a fixed gap. Appends to entry_quote_drift.csv, keyed by symbol."""
+    try:
+        secs = (datetime.now(timezone.utc) - entry_dt).total_seconds()
+        drift_pct = (quote["mid"] - entry_price) / entry_price * 100 if entry_price else None
+        path = "entry_quote_drift.csv"
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["logged_at", "symbol", "strategy", "entry_price", "entry_dt",
+                            "next_bid", "next_ask", "next_mid", "seconds_since_entry", "drift_pct"])
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(), symbol, strategy, entry_price,
+                entry_dt.isoformat(), quote["bid"], quote["ask"], quote["mid"],
+                f"{secs:.1f}", f"{drift_pct:.4f}" if drift_pct is not None else "",
+            ])
+    except Exception as e:
+        log.debug("entry quote drift log failed for %s: %s", symbol, e)
+
 
 def log_contract_pick(ticker: str, stock_price: float, strategy: str, target_delta: float,
                       dte_target: int, contract: dict, qty: int):
@@ -569,7 +767,9 @@ def log_contract_pick(ticker: str, stock_price: float, strategy: str, target_del
                             "symbol", "strike", "moneyness", "expiry",
                             "bid", "ask", "mid", "spread_pct", "open_interest",
                             "premium_per_contract", "qty", "cost", "implied_vol",
-                            "gamma", "theta", "vega", "rho"])
+                            "gamma", "theta", "vega", "rho",
+                            "last_trade_price", "last_trade_size", "last_trade_age_s",
+                            "trade_vs_spread"])
             w.writerow([
                 datetime.now(timezone.utc).isoformat(), ticker, strategy, f"{stock_price:.4f}",
                 target_delta, g.get("delta", ""), dte_target, dte,
@@ -579,6 +779,9 @@ def log_contract_pick(ticker: str, stock_price: float, strategy: str, target_del
                 contract.get("open_interest", ""), f"{contract['ask']*100:.2f}", qty,
                 f"{contract['ask']*100*qty:.2f}", g.get("iv", ""), g.get("gamma", ""),
                 g.get("theta", ""), g.get("vega", ""), g.get("rho", ""),
+                g.get("last_trade_price", ""), g.get("last_trade_size", ""),
+                f"{g['last_trade_age_s']:.1f}" if g.get("last_trade_age_s") is not None else "",
+                f"{g['trade_vs_spread']:.4f}" if g.get("trade_vs_spread") is not None else "",
             ])
     except Exception as e:
         log.debug("contract-pick probe failed: %s", e)
@@ -988,25 +1191,48 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
         contract["spread_pct"] * 100, qty,
     )
 
-    # Use a limit order at ask — avoids "no quote" rejection on market orders
+    # Marketable limit 10% above ask (root-caused 2026-07-22): a plain limit AT the ask can sit
+    # unfilled for minutes to hours if the market moves before it reaches the book — two live
+    # DAY orders (AAPL/FTAI news_call) sat at Alpaca status=new, filled_qty=0 for 40+/several+
+    # minutes while place_option_trade had ALREADY registered them in _monitored_positions and
+    # trades.csv as if filled, creating phantom "open" positions the dashboard and the bot's own
+    # dedup/cooldown logic both trusted. A marketable limit crosses the spread immediately in
+    # normal conditions — historical fill-latency on the mirror-image exit design
+    # (close_option_position's bid*0.90) is median 0.07s / p95 0.25s (n=90) in this account, so
+    # 10s of headroom is generous, not tight. _await_fill_price (already proven on the exit
+    # side) confirms the ACTUAL fill before anything is logged/registered; a still-unfilled
+    # order after 10s means something is genuinely wrong (halt, no offers, stale quote) rather
+    # than normal latency, so it's cancelled and skipped instead of recorded as a position.
+    marketable_limit = round(contract["ask"] * 1.10, 2)
     req = LimitOrderRequest(
         symbol=contract["symbol"],
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
-        limit_price=round(contract["ask"], 2),
+        limit_price=marketable_limit,
         position_intent=PositionIntent.BUY_TO_OPEN,
     )
     try:
         order = trading_client.submit_order(req)
-        max_loss = contract["ask"] * 100 * qty
-        log.info(
-            "✅ OPTION BUY  %s x%d  limit=$%.4f  cost_basis=$%.4f/contract  max_loss=$%.0f",
-            contract["symbol"], qty, contract["ask"], contract["ask"], max_loss,
-        )
     except Exception as e:
         log.error("Option buy failed: %s", e)
         return None
+
+    fill = _await_fill_price(order, timeout_s=10.0)
+    if fill is None:
+        try:
+            trading_client.cancel_order_by_id(order.id)
+        except Exception as ce:
+            log.warning("Could not cancel unfilled buy order %s: %s", order.id, ce)
+        log.warning("  → %s buy did not fill within 10s (limit=$%.4f vs ask $%.4f at decision time) "
+                    "— cancelled, skipping [%s]", contract["symbol"], marketable_limit, contract["ask"], strategy)
+        return None
+
+    max_loss = fill * 100 * qty
+    log.info(
+        "✅ OPTION BUY  %s x%d  fill=$%.4f  limit=$%.4f  cost_basis=$%.4f/contract  max_loss=$%.0f",
+        contract["symbol"], qty, fill, marketable_limit, fill, max_loss,
+    )
 
     # Protection is the IN-PROCESS monitor, not an exchange-held stop. This
     # account cannot hold uncovered option sell-stops (every place_stop_order is
@@ -1015,7 +1241,7 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
     # rejections (29 + 7 in one session). So we DON'T place a resting stop; the
     # monitor watches price each cycle and exits via close_option_position (the
     # working stop-limit-above-market method) when the trail is breached.
-    entry          = contract["ask"]
+    entry          = fill
     init_trail     = long_trail_for(strategy, "option", 0.0)
     _monitored_positions[contract["symbol"]] = {
         "qty":           qty,
@@ -1031,7 +1257,7 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
              contract["symbol"], entry, init_trail * 100, strategy)
 
     _recent_trades[ticker] = time.time()
-    log_trade(ticker, contract, qty, signal, contract["ask"], strategy=strategy)
+    log_trade(ticker, contract, qty, signal, fill, strategy=strategy)
 
     # Phase-0 contract-selection probe (read-only; logs pick fidelity, no behavior
     # change). Moved AFTER submit_order so its get_option_greeks round-trip never sits
@@ -2298,12 +2524,36 @@ async def trailing_stop_monitor():
             asset_type = pos.get("asset_type", "option")
             strategy   = pos.get("strategy", asset_type)
 
+            # Delayed trend log (2026-07-22): fires once per option position, TREND_DELAY_MIN
+            # after entry -- real-time option bars 403 ("OPRA agreement is not signed") on this
+            # data plan, so the fetch literally cannot succeed before then (see
+            # _option_recent_trend). Off the event loop via run_in_executor; fire-and-forget --
+            # pure research telemetry, nothing downstream reads the result, and both the fetch
+            # and the CSV write already catch their own exceptions.
+            if (asset_type not in ("stock", "stock_short") and symbol not in _trend_logged
+                    and pos.get("entry_dt")):
+                age_min = (datetime.now(timezone.utc) - pos["entry_dt"]).total_seconds() / 60
+                if age_min >= TREND_DELAY_MIN:
+                    _trend_logged.add(symbol)
+                    asyncio.get_event_loop().run_in_executor(
+                        None, _log_delayed_option_trend, symbol, pos["entry_dt"], strategy)
+
             # ── Get current price ─────────────────────────────────
             if asset_type in ("stock", "stock_short"):
                 underlying = pos.get("underlying", symbol.split("__")[0])
                 mid = _price_cache.get(underlying) or get_stock_price(underlying, subscribe=False)
             else:
                 q   = get_option_quote(symbol)
+
+                # First post-entry quote drift (2026-07-22) -- fires once, on whichever cycle
+                # first sees a real quote after entry. Reuses the q just fetched above, no
+                # extra API call. Off the event loop; fire-and-forget, self-contained errors.
+                if q and symbol not in _entry_quote_logged and pos.get("entry_dt"):
+                    _entry_quote_logged.add(symbol)
+                    asyncio.get_event_loop().run_in_executor(
+                        None, _log_entry_quote_drift, symbol, strategy,
+                        pos["entry_price"], pos["entry_dt"], q)
+
                 mid = q["mid"] if q else None
                 if q and q.get("spread_pct", 0) > MAX_MONITOR_SPREAD_PCT:
                     log.debug("  ⚠ %s bad quote (spread %.0f%%, mid $%.2f) — skipping cycle (protects peak/stop)",
@@ -3330,6 +3580,25 @@ async def handle_alpaca_news(news):
 
 # ── 2. SEC EDGAR 8-K RSS (poll) ───────────────────────────────────────────────
 
+def _log_sec_pointer(ticker: str, cik: int, accession: str, headline: str):
+    """Logs (cik, accession) for every SEC filing that got the full-content fetch (2026-07-23).
+    Since sec_rss_poller now sends the model a self-contained body derived entirely from this
+    pointer (see its comment), this is all that's needed to regenerate the EXACT historical
+    prompt input later for backtesting/prompt-tuning -- no need to store the document text
+    itself, which can be re-fetched from SEC's permanent archive at any time via
+    sec_edgar.fetch_8k_content(session, cik, accession, ...)."""
+    try:
+        path = "sec_scored_filings.csv"
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["timestamp", "ticker", "cik", "accession", "headline"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), ticker or "", cik, accession, headline[:150]])
+    except Exception as e:
+        log.debug("SEC pointer log failed: %s", e)
+
+
 async def sec_rss_poller():
     """Was scoring only the RSS filer-index title ("8-K - CompanyName (CIK) (Filer)") -- no
     ticker, no real disclosure text (see sec_edgar.py docstring / project_news_source_quality
@@ -3368,7 +3637,15 @@ async def sec_rss_poller():
                             log.debug("SEC 8-K content fetch failed for %s: %s", eid, e)
                             full_text = ""
                         if full_text:
-                            body = f"{summary}\n\n{full_text}"
+                            # Self-contained body, NOT summary+full_text (2026-07-23): fetch_8k_content's
+                            # skip_to_item logic already lands the extracted text right at the "Item X.XX"
+                            # heading, so the ephemeral RSS `summary` field adds nothing -- and dropping
+                            # it means everything the model sees is now 100% derivable, forever, from just
+                            # (cik, accession), confirmed by re-fetching a known filing's exact accession
+                            # and getting byte-identical content. Log the pointer so future prompt/backtest
+                            # work can regenerate this exact input without storing the document itself.
+                            body = full_text
+                            _log_sec_pointer(ticker, cik, accession, headline)
 
                     log.info("📰 [SEC 8-K] %s", headline[:100])
                     await process_signal(headline, body, "SEC EDGAR 8-K")

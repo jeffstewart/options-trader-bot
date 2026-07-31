@@ -22,6 +22,27 @@ services:
       - TRADER_LOG_DIR=/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # ── DNS (added 2026-07-30) ────────────────────────────────────────────────────────────────
+    # By default the container inherits the HOST's resolver chain via Docker's embedded DNS.
+    # On this Mac that chain is fragile: `scutil --dns` shows a local resolver at 127.0.0.1 plus
+    # routers on TWO different subnets (192.168.1.1 and 192.168.68.1), i.e. a local DNS proxy in
+    # front of a multi-network setup. When any of that flaps, every container lookup fails at
+    # once -- which is exactly the observed signature: short bursts of "Temporary failure in name
+    # resolution" hitting www.sec.gov, data.alpaca.markets and anything else in flight, clustered
+    # around 11:00-12:00 UTC (04-05 PDT) on 07-24, 07-29 and 07-30.
+    # Pointing the container at public resolvers removes the dependency on that host-side chain.
+    # host.docker.internal still resolves because extra_hosts writes it to /etc/hosts, which is
+    # consulted before DNS (verified: 192.168.5.2) -- so the host-Ollama ticker corrector is
+    # unaffected.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # More attempts with a shorter timeout: glibc defaults to timeout:5 attempts:2, so a single
+    # blip surfaces as an application error after 10s. 3 attempts at 2s rides out a brief flap
+    # inside one getaddrinfo() call instead of bubbling up.
+    dns_opt:
+      - timeout:2
+      - attempts:3
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

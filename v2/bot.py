@@ -22,9 +22,11 @@ Usage:
 """
 
 import asyncio
+import csv
 import logging
+import os
 import signal as os_signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import feedparser
@@ -36,10 +38,31 @@ import execution as ex
 import scoring
 import sec_edgar
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
 _seen_news_ids: set[str] = set()
+
+# Throttled logging for the two high-volume pipeline gates (market-closed / regime). Every
+# incoming article hits these, so per-item logging would bury the log -- instead emit the first
+# drop of each reason immediately, then one summary line every GATE_LOG_EVERY drops.
+# Counters self-reset on UTC date change (rather than being driven by market.py's daily-loss
+# reset) to avoid inverting the bot -> market import direction for a logging concern.
+GATE_LOG_EVERY = 50
+_gate_drop_counts: dict[str, int] = {}
+_gate_drop_day: "str | None" = None
+
+
+def _log_gate_drop(reason: str) -> None:
+    global _gate_drop_day
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != _gate_drop_day:
+        _gate_drop_day = today
+        _gate_drop_counts.clear()
+    n = _gate_drop_counts.get(reason, 0) + 1
+    _gate_drop_counts[reason] = n
+    if n == 1 or n % GATE_LOG_EVERY == 0:
+        log.info("  ⏸️  %s — dropping signals before scoring (%d so far today)", reason, n)
 
 
 async def process_signal(headline: str, body: str, source: str, symbols: list[str] = None,
@@ -51,11 +74,18 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
             log.info("  → stale news (%.0fs) — skipping", feed_lag_s)
             return
 
+    # Both of the next two gates used to `return` with NO log output at all. That made a fully
+    # gated bot indistinguishable from a broken one: diagnosed 2026-07-29, v2 had ingested 10k+
+    # news items and scored NOTHING since 07-23 (the last uptrend day) with zero trace in the log
+    # of why. These are the highest-volume drops in the pipeline, so they log at a throttled
+    # 1-line-per-N-drops cadence rather than per item.
     if not mkt.market_is_open():
+        _log_gate_drop("market closed")
         return
 
     # ── Regime gate FIRST — see module docstring for why this is safe in v2 ────────────────
     if not mkt.market_in_uptrend():
+        _log_gate_drop("regime gate: not in uptrend (long-only legs paused)")
         return
 
     # ── Pre-score filters (free, headline-only) ─────────────────────────────────────────────
@@ -96,11 +126,15 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
     if sentiment != "bullish":
         return   # v2 has no bearish/short strategy to feed -- nothing else to do with this signal
 
+    # The ONE threshold check (2026-07-29): a flat magnitude+confidence floor, replacing v1's
+    # sliding `BASE_CONFIDENCE + (1-mag)*CONFIDENCE_SLOPE` gate -- see config.py for why that went
+    # away. It stays HERE rather than at leg dispatch because everything below it costs money once
+    # the scorer swap lands: the ticker corrector is a second LLM call, and it would be spent on
+    # signals that cannot open a position anyway.
     magnitude, confidence = float(signal.get("magnitude", 0)), float(signal.get("confidence", 0))
-    if magnitude < cfg.MIN_MAGNITUDE:
-        return
-    required_conf = cfg.BASE_CONFIDENCE + (1 - magnitude) * cfg.CONFIDENCE_SLOPE
-    if confidence < required_conf:
+    if magnitude < cfg.MIN_MAGNITUDE or confidence < cfg.MIN_CONFIDENCE:
+        log.info("  → below threshold (mag=%.2f/%.2f conf=%.2f/%.2f) — skipping",
+                 magnitude, cfg.MIN_MAGNITUDE, confidence, cfg.MIN_CONFIDENCE)
         return
 
     tickers = signal.get("tickers") or []
@@ -123,7 +157,10 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
     if ticker in ("BTC", "ETH"):
         return
 
-    log.info("  🤖 %s: bullish conf=%.2f mag=%.2f ticker=%s", cfg.OLLAMA_MODEL, confidence, magnitude, ticker)
+    # cfg.SCORER_MODEL, not OLLAMA_MODEL -- this line still said "llama3.2" after the 2026-07-29
+    # Sonnet swap, so the 07-31 AMZN trade was logged as scored by a model that never saw it.
+    # OLLAMA_MODEL is now only the ticker corrector.
+    log.info("  🤖 %s: bullish conf=%.2f mag=%.2f ticker=%s", cfg.SCORER_MODEL, confidence, magnitude, ticker)
     log.info("     %s", signal.get("reasoning", ""))
 
     loop = asyncio.get_event_loop()
@@ -172,6 +209,72 @@ async def handle_alpaca_news(news):
         await process_signal(headline, body, "Alpaca/Benzinga", symbols=symbols, article_ts=article_ts)
 
 
+async def alpaca_news_rest_poller():
+    """REST-polling substitute for NewsDataStream (2026-07-19) -- see config.py's
+    USE_ALPACA_STREAMS docstring for why: the websocket counts against Alpaca's 1-connection
+    -per-login cap and collides with v1's own stream, REST calls don't. Cursors on the last
+    article's timestamp (falls back to `since` unchanged if a poll returns nothing), with
+    _seen_news_ids as a belt-and-suspenders dedup against boundary repeats."""
+    log.info("📡 Alpaca news REST poller started (every %ds)", cfg.NEWS_POLL_SECS)
+    url = "https://data.alpaca.markets/v1beta1/news"
+    headers = {"APCA-API-KEY-ID": cfg.ALPACA_KEY, "APCA-API-SECRET-KEY": cfg.ALPACA_SECRET}
+    since = datetime.now(timezone.utc) - timedelta(seconds=cfg.NEWS_POLL_SECS)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                params = {"start": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "sort": "asc", "limit": "50"}
+                async with session.get(url, headers=headers, params=params,
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    data = await r.json()
+                items = data.get("news", [])
+                for item in items:
+                    news_id = str(item.get("id"))
+                    if news_id in _seen_news_ids:
+                        continue
+                    _seen_news_ids.add(news_id)
+                    headline = item.get("headline", "") or ""
+                    body = item.get("summary", "") or ""
+                    symbols = item.get("symbols") or []
+                    raw_ts = item.get("updated_at") or item.get("created_at")
+                    article_ts = None
+                    if raw_ts:
+                        try:
+                            article_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                    log.info("📰 [Alpaca] %s", headline[:100])
+                    await process_signal(headline, body, "Alpaca/Benzinga", symbols=symbols, article_ts=article_ts)
+                if items:
+                    last_ts = items[-1].get("updated_at") or items[-1].get("created_at")
+                    if last_ts:
+                        try:
+                            since = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+            except Exception as e:
+                log.warning("Alpaca news REST poll failed: %s", e)
+            await asyncio.sleep(cfg.NEWS_POLL_SECS)
+
+
+def _log_sec_pointer(ticker: str, cik: int, accession: str, headline: str):
+    """Logs (cik, accession) for every SEC filing that got the full-content fetch (2026-07-23).
+    Since sec_rss_poller now sends the model a self-contained body derived entirely from this
+    pointer (see its comment), this is all that's needed to regenerate the EXACT historical
+    prompt input later for backtesting/prompt-tuning -- no need to store the document text
+    itself, which can be re-fetched from SEC's permanent archive at any time via
+    sec_edgar.fetch_8k_content(session, cik, accession, ...)."""
+    try:
+        path = "sec_scored_filings.csv"
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["timestamp", "ticker", "cik", "accession", "headline"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), ticker or "", cik, accession, headline[:150]])
+    except Exception as e:
+        log.debug("SEC pointer log failed: %s", e)
+
+
 async def sec_rss_poller():
     """Was scoring the bare RSS filer-index title with an EMPTY body -- no ticker, no content at
     all (see sec_edgar.py docstring / project_news_source_quality memory: 99.7% of SEC signals
@@ -208,7 +311,15 @@ async def sec_rss_poller():
                             log.debug("SEC 8-K content fetch failed for %s: %s", eid, e)
                             full_text = ""
                         if full_text:
-                            body = f"{summary}\n\n{full_text}"
+                            # Self-contained body, NOT summary+full_text (2026-07-23, ported from
+                            # core/bot.py): fetch_8k_content's skip_to_item logic already lands the
+                            # extracted text right at the "Item X.XX" heading, so the ephemeral RSS
+                            # `summary` adds nothing -- dropping it means everything the model sees
+                            # is 100% derivable, forever, from just (cik, accession). Log the
+                            # pointer so future prompt/backtest work can regenerate this exact
+                            # input without storing the document itself.
+                            body = full_text
+                            _log_sec_pointer(ticker, cik, accession, headline)
 
                     log.info("📰 [SEC 8-K] %s", headline[:100])
                     await process_signal(headline, body, "SEC EDGAR 8-K")
@@ -233,35 +344,56 @@ async def _supervised(make_coro, name):
 
 
 async def main():
-    log.info("🚀 Trader bot v2 starting (paper mode · model: %s)", cfg.OLLAMA_MODEL)
+    log.info("🚀 Trader bot v2 starting (paper mode · scorer: %s)", cfg.SCORER_MODEL)
     log.info("   Position budget      : %.0f%% of equity (flat, not magnitude-scaled)",
               cfg.MAX_POSITION_FRAC_OF_EQUITY * 100)
     log.info("   Max open positions   : %d", cfg.MAX_OPEN_POSITIONS)
     log.info("   Daily loss limit     : %.0f%% of equity, resets 00:00 UTC", cfg.DAILY_LOSS_LIMIT_PCT * 100)
     log.info("   Ticker corrector     : %s", "ON" if cfg.TICKER_CORRECTOR_ENABLED else "OFF")
     log.info("   Confirm/veto gate    : REMOVED (see config.py module docstring)")
+    log.info("   SEC EDGAR 8-K feed   : %s", "ON" if cfg.SEC_FEED_ENABLED else "OFF (unproven — see config.py)")
     log.info("   Pairs / bear_short   : REMOVED (see config.py module docstring)")
+    log.info("   Scorer thresholds    : mag>=%.2f AND conf>=%.2f (single gate, %s scale)",
+             cfg.MIN_MAGNITUDE, cfg.MIN_CONFIDENCE, cfg.SCORER_MODEL)
+    log.info("   Scorer effort/think  : %s / %s", cfg.SCORER_EFFORT, cfg.SCORER_THINKING)
+
+    # Fail fast and LOUD: without a working scorer this bot cannot trade, and a silent scorer
+    # failure is indistinguishable from a quiet market. Exit rather than run blind.
+    if not scoring.preflight():
+        log.error("🛑 scorer preflight failed — exiting instead of running with a dead scorer.")
+        return
 
     log.info("📂 Loading open positions from Alpaca…")
     ex.load_open_positions_from_alpaca()
 
-    PRICE_WATCHLIST = sorted(cfg.TRADEABLE_ETFS | {
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
-        "JPM", "GS", "MS", "BAC", "AMD", "INTC", "QCOM", "MU",
-    })
-    mkt.subscribe_price_stream(PRICE_WATCHLIST)
+    stream = None
+    news_task = None
+    stock_task = None
+    if cfg.USE_ALPACA_STREAMS:
+        PRICE_WATCHLIST = sorted(cfg.TRADEABLE_ETFS | {
+            "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+            "JPM", "GS", "MS", "BAC", "AMD", "INTC", "QCOM", "MU",
+        })
+        mkt.subscribe_price_stream(PRICE_WATCHLIST)
 
-    stream = NewsDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
-    mkt.patch_reconnect_safety(stream, "news")
-    stream.subscribe_news(handle_alpaca_news, "*")
+        stream = NewsDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
+        mkt.patch_reconnect_safety(stream, "news")
+        stream.subscribe_news(handle_alpaca_news, "*")
+
+        news_task = asyncio.create_task(_supervised(stream._run_forever, "news stream"))
+        stock_task = asyncio.create_task(_supervised(mkt.stock_stream._run_forever, "stock stream"))
+    else:
+        log.info("📡 USE_ALPACA_STREAMS=false — news via REST polling, prices via on-demand REST (no persistent connections)")
+        news_task = asyncio.create_task(_supervised(alpaca_news_rest_poller, "news REST poller"))
 
     log.info("📡 All news sources starting…")
-    tasks = [
-        asyncio.create_task(_supervised(stream._run_forever, "news stream")),
-        asyncio.create_task(_supervised(mkt.stock_stream._run_forever, "stock stream")),
+    tasks = [t for t in (news_task, stock_task) if t is not None] + [
         asyncio.create_task(_supervised(ex.trailing_stop_monitor, "trailing-stop monitor")),
-        asyncio.create_task(_supervised(sec_rss_poller, "SEC RSS poller")),
     ]
+    if cfg.SEC_FEED_ENABLED:
+        tasks.append(asyncio.create_task(_supervised(sec_rss_poller, "SEC RSS poller")))
+    else:
+        log.info("📡 SEC EDGAR 8-K feed: DISABLED (config.SEC_FEED_ENABLED) — Alpaca/Benzinga only")
 
     # ── Graceful shutdown (2026-07-17) ───────────────────────────────────────────────────────
     # `pkill`/manage.sh send SIGTERM, and with NO handler Python's default disposition kills the
@@ -287,12 +419,13 @@ async def main():
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    log.info("🔌 Closing data-stream connections cleanly…")
-    for s in (stream, mkt.stock_stream):
-        try:
-            await s.close()
-        except Exception as e:
-            log.debug("stream close error: %s", e)
+    if cfg.USE_ALPACA_STREAMS:
+        log.info("🔌 Closing data-stream connections cleanly…")
+        for s in (stream, mkt.stock_stream):
+            try:
+                await s.close()
+            except Exception as e:
+                log.debug("stream close error: %s", e)
     log.info("👋 Shutdown complete")
 
 

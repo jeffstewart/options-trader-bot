@@ -282,6 +282,86 @@ def bot_is_running() -> bool:
         return False
 
 
+def _downday_detail(bars, dd_win: int, dd_max: float):
+    """Per-session up/down sequence for the chop window, plus a best-case estimate of how many
+    more sessions must pass before the down-day density can clear.
+
+    WHY THE SEQUENCE AND NOT JUST THE COUNT (jeff, 2026-07-30): the density is a rolling window, so
+    WHEN the down days sit determines when the gate can reopen. 7 down days bunched at the OLD end
+    roll off within a couple of sessions; the same 7 at the NEW end mean a long wait. The count
+    alone cannot distinguish those two, and it is the difference between "maybe trades tomorrow"
+    and "definitely nothing this week".
+
+    `sessions_to_clear` assumes EVERY future session closes up -- it is a floor ("at least this
+    many"), never a forecast. Returns 0 when the chop test already passes.
+    """
+    if dd_win <= 0 or len(bars) <= dd_win:
+        return [], 0
+    window = bars[-dd_win - 1:]                       # dd_win+1 bars -> dd_win comparisons
+    days = []
+    for prev, cur in zip(window[:-1], window[1:]):
+        ts = getattr(cur, "timestamp", None)
+        days.append({"date": ts.strftime("%Y-%m-%d") if ts else "",
+                     "down": float(cur.close) < float(prev.close),
+                     "pct": round((float(cur.close) / float(prev.close) - 1) * 100, 2)})
+    limit = dd_max * dd_win                           # density < dd_max  <=>  count < limit
+    downs = [d["down"] for d in days]
+    sessions = next((k for k in range(dd_win + 1) if sum(downs[k:]) < limit), dd_win)
+    return days, sessions
+
+
+def get_regime() -> dict:
+    """Same math as core/bot.py's regime_status() (2026-07-20) -- duplicated here rather than
+    imported because bot.py is a 3000+ line monolith with heavy module-level side effects
+    (client construction, background state) that isn't safe to import into a read-only dashboard
+    process. Keep this in sync with bot.py's regime_status() if the REGIME_* logic ever changes.
+    Also reports pairs_enabled/bear_short_enabled: those strategies trade regardless of regime
+    (see bot.py's process_signal), so a regime block does NOT mean the whole bot is idle."""
+    if not config.REGIME_FILTER_ENABLED:
+        return {"enabled": False, "uptrend": True}
+    try:
+        ma_days = config.REGIME_MA_DAYS
+        start = datetime.now(timezone.utc) - timedelta(days=int(ma_days * 1.6) + 30)
+        resp = _data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=config.REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
+        _regime_bars = (resp.data or {}).get(config.REGIME_INDEX, [])
+        closes = [float(b.close) for b in _regime_bars]
+        if len(closes) < ma_days:
+            return {"enabled": True, "uptrend": True, "insufficient_data": True,
+                    "bars": len(closes), "bars_needed": ma_days}
+
+        sma = sum(closes[-ma_days:]) / ma_days
+        price = closes[-1]
+        above_sma = price >= sma
+
+        mom_days = config.REGIME_MOMENTUM_DAYS
+        has_mom = mom_days > 0 and len(closes) > mom_days
+        mom_price_then = closes[-1 - mom_days] if has_mom else None
+        mom_ok = mom_days <= 0 or not has_mom or price >= mom_price_then
+
+        dd_win = config.REGIME_DOWNDAY_WINDOW
+        if dd_win > 0 and len(closes) > dd_win:
+            dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
+                              if b < a) / dd_win
+        else:
+            dd_density = 0.0
+        chop_ok = dd_win <= 0 or dd_density < config.REGIME_DOWNDAY_MAX_DENSITY
+        dd_days, dd_to_clear = _downday_detail(_regime_bars, dd_win, config.REGIME_DOWNDAY_MAX_DENSITY)
+
+        return {
+            "enabled": True, "uptrend": above_sma and mom_ok and chop_ok,
+            "index": config.REGIME_INDEX, "price": price,
+            "sma": round(sma, 2), "sma_days": ma_days, "above_sma": above_sma,
+            "mom_ok": mom_ok, "mom_days": mom_days, "mom_price_then": mom_price_then,
+            "dd_density": round(dd_density, 4), "dd_window": dd_win,
+            "dd_days": dd_days, "dd_sessions_to_clear": dd_to_clear,
+            "dd_max": config.REGIME_DOWNDAY_MAX_DENSITY, "chop_ok": chop_ok,
+            "pairs_enabled": config.PAIRS_ENABLED, "bear_short_enabled": config.BEAR_SHORT_ENABLED,
+        }
+    except Exception as e:
+        return {"enabled": True, "uptrend": True, "error": str(e)}
+
+
 def get_account() -> dict:
     try:
         a = trading_client.get_account()
@@ -744,6 +824,7 @@ def api_status():
         "bot_running":   bot_is_running(),
         "timestamp":     datetime.now(timezone.utc).isoformat(),
         "account":       account,
+        "regime":        get_regime(),
         "positions":     positions,
         "recent_trades": trades,
         "stats":         stats,
@@ -897,6 +978,19 @@ HTML = r"""<!DOCTYPE html>
     padding: 2px 7px; border-radius: 10px; text-transform: uppercase;
   }
 
+  .gate-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 12px;
+                text-transform: uppercase; letter-spacing: .4px; }
+  .gate-badge.open { background: #16653422; color: var(--green); }
+  .gate-badge.blocked { background: #7f1d1d22; color: var(--red); }
+  .gate-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .gate-row:last-child { border-bottom: none; }
+  .gate-check { font-weight: 700; width: 16px; text-align: center; flex-shrink: 0; }
+  .gate-check.pass { color: var(--green); } .gate-check.fail { color: var(--red); }
+  .gate-label { flex: 1; }
+  .gate-detail { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
+  .gate-need { font-size: 12px; color: var(--yellow); margin-top: 6px; padding-top: 8px; border-top: 1px dashed var(--border); }
+  .gate-scope { font-size: 12px; color: var(--muted); margin-top: 6px; padding-top: 8px; border-top: 1px dashed var(--border); }
+
   /* Activity feed */
   .feed { display: flex; flex-direction: column; gap: 0; }
   .feed-item {
@@ -989,7 +1083,14 @@ HTML = r"""<!DOCTYPE html>
     background: var(--border); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 3px 6px; font-size: 12px; color-scheme: dark;
   }
-</style>
+
+    .gate-strip { display:flex; align-items:center; gap:3px; margin:-2px 0 8px 26px; flex-wrap:wrap; }
+    .gate-strip-cap { font-size:10px; color:var(--muted); }
+    .gate-day { display:inline-block; width:11px; height:16px; border-radius:2px; opacity:.85; }
+    .gate-day:hover { opacity:1; }
+    .gate-strip-eta { font-size:11px; color:#f59e0b; margin-left:6px; }
+    .gate-strip-ok { font-size:11px; color:var(--green); margin-left:6px; }
+    </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -1002,6 +1103,15 @@ HTML = r"""<!DOCTYPE html>
 </header>
 
 <main>
+  <!-- Trading Gate -->
+  <div class="card" id="regimeCard">
+    <div class="card-title-row">
+      <div class="card-title">Trading Gate</div>
+      <span id="regimeBadge" class="gate-badge">—</span>
+    </div>
+    <div id="regimeBody"><div class="empty">Loading…</div></div>
+  </div>
+
   <!-- P&L + Account -->
   <div class="grid-2" style="margin-bottom:12px">
     <div class="card" style="margin-bottom:0">
@@ -1162,6 +1272,78 @@ function stratPill(s) {
   return `<span class="strategy-pill" style="background:${c}22;color:${c}">${esc(s||"—")}</span>`;
 }
 
+function renderRegime(r) {
+  const badge = document.getElementById("regimeBadge");
+  if (!r || r.enabled === false) {
+    badge.textContent = "FILTER OFF"; badge.className = "gate-badge open";
+    return '<div class="empty">Regime filter disabled — not gating trades.</div>';
+  }
+  if (r.error) {
+    badge.textContent = "CHECK FAILED"; badge.className = "gate-badge open";
+    return `<div class="empty">Regime check failed (${esc(r.error)}) — defaulting to allow trades until this clears.</div>`;
+  }
+  if (r.insufficient_data) {
+    badge.textContent = "WARMING UP"; badge.className = "gate-badge open";
+    return `<div class="empty">Only ${r.bars} of ${r.bars_needed} days of history available — defaulting to allow trades.</div>`;
+  }
+
+  badge.textContent = r.uptrend ? "Trading enabled" : "Blocked";
+  badge.className = "gate-badge " + (r.uptrend ? "open" : "blocked");
+
+  const rows = [];
+  const gapPct = (r.price / r.sma - 1) * 100;
+  rows.push({
+    ok: r.above_sma,
+    label: `${r.index} above ${r.sma_days}d SMA`,
+    detail: `$${r.price.toFixed(2)} vs $${r.sma.toFixed(2)} (${gapPct>=0?"+":""}${gapPct.toFixed(1)}%)`,
+    need: r.above_sma ? null : `${r.index} needs to close ${Math.abs(gapPct).toFixed(1)}% higher, above $${r.sma.toFixed(2)}`,
+  });
+  if (r.mom_price_then != null) {
+    const momPct = (r.price / r.mom_price_then - 1) * 100;
+    rows.push({
+      ok: r.mom_ok,
+      label: `Momentum (vs ${r.mom_days}d ago)`,
+      detail: `$${r.price.toFixed(2)} vs $${r.mom_price_then.toFixed(2)} (${momPct>=0?"+":""}${momPct.toFixed(1)}%)`,
+      need: r.mom_ok ? null : `${r.index} needs to get back above its price from ${r.mom_days} days ago ($${r.mom_price_then.toFixed(2)}, ${Math.abs(momPct).toFixed(1)}% away)`,
+    });
+  }
+  rows.push({
+    ok: r.chop_ok,
+    label: `Chop (down-days, last ${r.dd_window}d)`,
+    detail: `${(r.dd_density*100).toFixed(0)}% vs ${(r.dd_max*100).toFixed(0)}% max`,
+    need: r.chop_ok ? null : `Down-day density needs to drop under ${(r.dd_max*100).toFixed(0)}% over the trailing ${r.dd_window} days (currently ${(r.dd_density*100).toFixed(0)}%)`,
+    extra: (r.dd_days && r.dd_days.length) ? `<div class="gate-strip">
+      <span class="gate-strip-cap">older</span>
+      ${r.dd_days.map(d => `<span class="gate-day" title="${d.date} · ${d.down?'down':'up'} ${d.pct>=0?'+':''}${d.pct}%" style="background:${d.down?'var(--red)':'var(--green)'}"></span>`).join('')}
+      <span class="gate-strip-cap">newer</span>
+      ${r.dd_sessions_to_clear > 0
+         ? `<span class="gate-strip-eta">≥${r.dd_sessions_to_clear} up-session${r.dd_sessions_to_clear>1?'s':''} to clear chop</span>`
+         : `<span class="gate-strip-ok">chop clear</span>`}
+    </div>` : "",
+  });
+
+  let html = "";
+  for (const row of rows) {
+    html += `<div class="gate-row">
+      <span class="gate-check ${row.ok?'pass':'fail'}">${row.ok?'✓':'✗'}</span>
+      <span class="gate-label">${row.label}</span>
+      <span class="gate-detail">${row.detail}</span>
+    </div>`;
+    if (row.extra) html += row.extra;
+  }
+  const needs = rows.filter(x => x.need).map(x => x.need);
+  if (needs.length) {
+    html += `<div class="gate-need">To resume: ${needs.join(" · ")}</div>`;
+  }
+  const stillOn = [];
+  if (r.pairs_enabled) stillOn.push("pairs");
+  if (r.bear_short_enabled) stillOn.push("bear_short");
+  html += stillOn.length
+    ? `<div class="gate-scope">This gate blocks news_call / PEAD / stock / lotto / qqq_macro only — ${stillOn.join(" and ")} trade${stillOn.length>1?"":"s"} regardless of regime.</div>`
+    : `<div class="gate-scope">This gate blocks news_call / PEAD / stock / lotto / qqq_macro (all long-beta legs).</div>`;
+  return html;
+}
+
 function renderStrategy(data) {
   if (!data || !Object.keys(data).length)
     return '<div class="empty">No strategy data yet — trades will appear here after the first close</div>';
@@ -1310,6 +1492,8 @@ async function refresh() {
     // Status pill
     document.getElementById("statusDot").className = "dot " + (data.bot_running ? "green" : "red");
     document.getElementById("statusText").textContent = data.bot_running ? "Bot running" : "Bot stopped";
+
+    document.getElementById("regimeBody").innerHTML = renderRegime(data.regime);
 
     // Account
     const a = data.account || {};

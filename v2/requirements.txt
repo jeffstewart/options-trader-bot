@@ -3,6 +3,9 @@
 # Pinned to the same versions as the working v1 venv for consistency.
 aiohttp==3.13.5
 alpaca-py==0.43.4
+# Primary scorer moved from local Ollama to Sonnet 5 (2026-07-29). `openai` below is STILL needed:
+# the ticker corrector remains a local (free) Ollama call through that client.
+anthropic==0.116.0
 beautifulsoup4==4.14.3
 feedparser==6.0.12
 Flask==3.1.3

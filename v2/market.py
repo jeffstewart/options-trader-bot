@@ -43,6 +43,34 @@ stock_data_client  = StockHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET
 stock_stream       = StockDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
 
 
+def patch_request_timeout(client, label: str, timeout_s: float = 10.0):
+    """alpaca-py's synchronous REST clients (TradingClient, *HistoricalDataClient) pass NO
+    timeout to the underlying requests.Session -- confirmed by reading RESTClient._one_request,
+    which calls self._session.request(method, url, **opts) with no timeout kwarg anywhere. These
+    clients are called directly from async code all over v2 (market_is_open, market_in_uptrend,
+    account_equity, get_option_quote, ...), NOT via run_in_executor. If a connection ever stalls
+    -- observed 2026-07-20 after v2 ran silently at 0% CPU for ~17h overnight, right after a
+    cluster of SEC-poll network hiccups -- a synchronous call with no timeout blocks forever, and
+    since asyncio is single-threaded that freezes the ENTIRE event loop, not just the one task
+    that made the call: every poller and monitor goes silent at once with no exception for
+    _supervised to catch and no way to notice short of watching the logs stop. Patching the
+    session here is one choke point that bounds every call through this client, current and
+    future, instead of auditing/wrapping each call site individually."""
+    orig_request = client._session.request
+
+    def _request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout_s)
+        return orig_request(method, url, **kwargs)
+
+    client._session.request = _request_with_timeout
+    log.info("⏱️  %s client: default request timeout %.0fs", label, timeout_s)
+
+
+patch_request_timeout(trading_client, "trading")
+patch_request_timeout(option_data_client, "option-data")
+patch_request_timeout(stock_data_client, "stock-data")
+
+
 def patch_reconnect_safety(stream, label: str):
     """Data-WS reconnect hardening. Root-caused 2026-07-17 (a v2 smoke test tight-looped ~17/s,
     350 times in 20s): alpaca-py's "connection limit exceeded" is raised by _auth() (a SERVER-
@@ -160,12 +188,25 @@ def _time_stop_hit(pos: dict) -> bool:
     return (datetime.now(timezone.utc) - entry_dt).days >= max_days
 
 
-def _lotto_stop_loss_hit(pos: dict, mid: float) -> bool:
-    """Entry-anchored (not peak-anchored) hard stop -- checked continuously, any time of day."""
+def lotto_stop_price(pos: dict) -> float:
+    """Current stop level for a lotto position: the HIGHER of an entry-anchored floor and a
+    trailing stop off the running peak. Monotonic -- peak_price only rises, so the level can never
+    loosen. Returns an absolute premium, not a percentage."""
     entry = pos.get("entry_price")
     if not entry:
+        return 0.0
+    floor = entry * (1 - cfg.LOTTO_STOP_LOSS_PCT)     # worst case, anchored to entry
+    peak = max(pos.get("peak_price") or entry, entry)
+    trail = peak * (1 - cfg.LOTTO_TRAIL_PCT)          # rises with every new peak
+    return max(floor, trail)
+
+
+def _lotto_stop_loss_hit(pos: dict, mid: float) -> bool:
+    """Hard stop -- checked continuously, any time of day. Anchored to entry until the ratchet
+    arms, then to the locked-in level (see lotto_stop_price)."""
+    if not pos.get("entry_price"):
         return False
-    return mid <= entry * (1 - cfg.LOTTO_STOP_LOSS_PCT)
+    return mid <= lotto_stop_price(pos)
 
 
 def _lotto_same_day_exit_hit(pos: dict) -> bool:
@@ -258,6 +299,83 @@ def near_market_close(within_min: int = cfg.TIME_STOP_EOD_WINDOW_MIN) -> bool:
         return False
 
 
+def _downday_detail(bars, dd_win: int, dd_max: float):
+    """Per-session up/down sequence for the chop window, plus a best-case estimate of how many
+    more sessions must pass before the down-day density can clear.
+
+    WHY THE SEQUENCE AND NOT JUST THE COUNT (jeff, 2026-07-30): the density is a rolling window, so
+    WHEN the down days sit determines when the gate can reopen. 7 down days bunched at the OLD end
+    roll off within a couple of sessions; the same 7 at the NEW end mean a long wait. The count
+    alone cannot distinguish those two, and it is the difference between "maybe trades tomorrow"
+    and "definitely nothing this week".
+
+    `sessions_to_clear` assumes EVERY future session closes up -- it is a floor ("at least this
+    many"), never a forecast. Returns 0 when the chop test already passes.
+    """
+    if dd_win <= 0 or len(bars) <= dd_win:
+        return [], 0
+    window = bars[-dd_win - 1:]                       # dd_win+1 bars -> dd_win comparisons
+    days = []
+    for prev, cur in zip(window[:-1], window[1:]):
+        ts = getattr(cur, "timestamp", None)
+        days.append({"date": ts.strftime("%Y-%m-%d") if ts else "",
+                     "down": float(cur.close) < float(prev.close),
+                     "pct": round((float(cur.close) / float(prev.close) - 1) * 100, 2)})
+    limit = dd_max * dd_win                           # density < dd_max  <=>  count < limit
+    downs = [d["down"] for d in days]
+    sessions = next((k for k in range(dd_win + 1) if sum(downs[k:]) < limit), dd_win)
+    return days, sessions
+
+
+def regime_status() -> dict:
+    """Live regime computation with the full diagnostic breakdown (price, SMA, momentum, chop),
+    not just the pass/fail bool -- factored out of market_in_uptrend() (2026-07-20) so the
+    dashboard can call the exact same math for display (what's failing and by how much) without
+    duplicating it and risking drift. No caching, no logging, no side effects -- safe to call
+    from a read-only process on every page load."""
+    if not cfg.REGIME_FILTER_ENABLED:
+        return {"enabled": False, "uptrend": True}
+    try:
+        start = datetime.now(timezone.utc) - timedelta(days=int(cfg.REGIME_MA_DAYS * 1.6) + 30)
+        resp = stock_data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=cfg.REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
+        _regime_bars = (resp.data or {}).get(cfg.REGIME_INDEX, [])
+        closes = [float(b.close) for b in _regime_bars]
+        if len(closes) < cfg.REGIME_MA_DAYS:
+            return {"enabled": True, "uptrend": True, "insufficient_data": True,
+                    "bars": len(closes), "bars_needed": cfg.REGIME_MA_DAYS}
+
+        sma = sum(closes[-cfg.REGIME_MA_DAYS:]) / cfg.REGIME_MA_DAYS
+        price = closes[-1]
+        above_sma = price >= sma
+
+        mom_days = cfg.REGIME_MOMENTUM_DAYS
+        has_mom = mom_days > 0 and len(closes) > mom_days
+        mom_price_then = closes[-1 - mom_days] if has_mom else None
+        mom_ok = mom_days <= 0 or not has_mom or price >= mom_price_then
+
+        dd_win = cfg.REGIME_DOWNDAY_WINDOW
+        if dd_win > 0 and len(closes) > dd_win:
+            dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
+                              if b < a) / dd_win
+        else:
+            dd_density = 0.0
+        chop_ok = dd_win <= 0 or dd_density < cfg.REGIME_DOWNDAY_MAX_DENSITY
+        dd_days, dd_to_clear = _downday_detail(_regime_bars, dd_win, cfg.REGIME_DOWNDAY_MAX_DENSITY)
+
+        return {
+            "enabled": True, "uptrend": above_sma and mom_ok and chop_ok,
+            "index": cfg.REGIME_INDEX, "price": price,
+            "sma": round(sma, 2), "sma_days": cfg.REGIME_MA_DAYS, "above_sma": above_sma,
+            "mom_ok": mom_ok, "mom_days": mom_days, "mom_price_then": mom_price_then,
+            "dd_density": round(dd_density, 4), "dd_window": dd_win,
+            "dd_days": dd_days, "dd_sessions_to_clear": dd_to_clear,
+            "dd_max": cfg.REGIME_DOWNDAY_MAX_DENSITY, "chop_ok": chop_ok,
+        }
+    except Exception as e:
+        return {"enabled": True, "uptrend": True, "error": str(e)}
+
+
 def market_in_uptrend() -> bool:
     """200d SMA + momentum brake + chop brake (2026-07-16). No bypass in v2 — the mechanism
     was tightly coupled to the confirm/veto gate's fail-closed logic, which no longer exists,
@@ -268,35 +386,18 @@ def market_in_uptrend() -> bool:
     today = date.today()
     if _regime_cache["date"] == today:
         return _regime_cache["uptrend"]
-    try:
-        start = datetime.now(timezone.utc) - timedelta(days=int(cfg.REGIME_MA_DAYS * 1.6) + 30)
-        resp = stock_data_client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=cfg.REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
-        closes = [float(b.close) for b in (resp.data or {}).get(cfg.REGIME_INDEX, [])]
-        if len(closes) < cfg.REGIME_MA_DAYS:
-            log.warning("Regime: only %d bars (<%d) — defaulting to uptrend", len(closes), cfg.REGIME_MA_DAYS)
-            up = True
-        else:
-            sma = sum(closes[-cfg.REGIME_MA_DAYS:]) / cfg.REGIME_MA_DAYS
-            above_sma = closes[-1] >= sma
-            mom_ok = (cfg.REGIME_MOMENTUM_DAYS <= 0 or len(closes) <= cfg.REGIME_MOMENTUM_DAYS
-                      or closes[-1] >= closes[-1 - cfg.REGIME_MOMENTUM_DAYS])
-            dd_win = cfg.REGIME_DOWNDAY_WINDOW
-            if dd_win > 0 and len(closes) > dd_win:
-                dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
-                                 if b < a) / dd_win
-            else:
-                dd_density = 0.0
-            chop_ok = dd_win <= 0 or dd_density < cfg.REGIME_DOWNDAY_MAX_DENSITY
-            up = above_sma and mom_ok and chop_ok
-            log.info("📐 Regime: %s $%.2f vs %dd SMA $%.2f (%s) · mom %s · %dd down-days %.0f%% (%s) → %s",
-                      cfg.REGIME_INDEX, closes[-1], cfg.REGIME_MA_DAYS, sma,
-                      "above" if above_sma else "below", "ok" if mom_ok else "down",
-                      dd_win, dd_density * 100, "ok" if chop_ok else "choppy",
-                      "UPTREND" if up else "PAUSED")
-    except Exception as e:
-        log.warning("Regime check failed (%s) — defaulting to uptrend", e)
-        up = True
+    st = regime_status()
+    up = st.get("uptrend", True)
+    if st.get("error"):
+        log.warning("Regime check failed (%s) — defaulting to uptrend", st["error"])
+    elif st.get("insufficient_data"):
+        log.warning("Regime: only %d bars (<%d) — defaulting to uptrend", st["bars"], st["bars_needed"])
+    else:
+        log.info("📐 Regime: %s $%.2f vs %dd SMA $%.2f (%s) · mom %s · %dd down-days %.0f%% (%s) → %s",
+                  st["index"], st["price"], st["sma_days"], st["sma"],
+                  "above" if st["above_sma"] else "below", "ok" if st["mom_ok"] else "down",
+                  st["dd_window"], st["dd_density"] * 100, "ok" if st["chop_ok"] else "choppy",
+                  "UPTREND" if up else "PAUSED")
     _regime_cache.update(date=today, uptrend=up)
     return up
 

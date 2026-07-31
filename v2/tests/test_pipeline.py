@@ -2,6 +2,8 @@
 corrector, and equity-relative sizing (the structural fixes from the small-account rework)."""
 import asyncio
 
+import pytest
+
 import config as cfg
 import execution as ex
 import market as mkt
@@ -34,6 +36,96 @@ def test_regime_gate_open_allows_scoring(monkeypatch):
 
     asyncio.run(bot.process_signal("Some headline", "body", "test"))
     assert called == [1], "scorer SHOULD be called once the regime gate is open"
+
+
+def _open_gates(monkeypatch):
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
+    monkeypatch.setattr(mkt, "near_market_close", lambda **k: False)
+    monkeypatch.setattr(mkt, "on_cooldown", lambda t: False)
+    monkeypatch.setattr(ex, "log_regime_decision", lambda *a, **k: None)
+
+
+def test_threshold_check_precedes_the_ticker_corrector(monkeypatch):
+    """The single threshold gate must sit BEFORE the corrector: once the scorer is a paid model
+    the corrector is a second billable call, and spending it on a signal that cannot open a
+    position is pure waste. Guards the ordering, which is easy to break by moving the check
+    down to leg dispatch."""
+    _open_gates(monkeypatch)
+    monkeypatch.setattr(cfg, "MIN_MAGNITUDE", 0.35)
+    monkeypatch.setattr(cfg, "MIN_CONFIDENCE", 0.70)
+    monkeypatch.setattr(scoring, "score_article", lambda h, b, s: {
+        "sentiment": "bullish", "magnitude": 0.40, "confidence": 0.55, "tickers": ["AAPL"]})
+
+    corrector_calls, lotto_calls = [], []
+    monkeypatch.setattr(scoring, "correct_ticker",
+                        lambda h, b, c: corrector_calls.append(1) or "AAPL")
+    monkeypatch.setattr(ex, "execute_lotto", lambda t, s: lotto_calls.append(1))
+
+    asyncio.run(bot.process_signal("headline", "body", "test", symbols=["AAPL"]))
+    assert corrector_calls == [], "corrector must not run on a below-threshold signal"
+    assert lotto_calls == []
+
+
+def test_single_threshold_pair_admits_the_validated_cell(monkeypatch):
+    """mag>=0.35 AND conf>=0.70 (the sonnet5 grid's best total-$ cell) is the ONLY bar. A signal
+    at exactly the floor must reach execute_lotto -- under v1's old sliding formula the same
+    signal needed conf>=0.862 and was rejected."""
+    _open_gates(monkeypatch)
+    monkeypatch.setattr(cfg, "MIN_MAGNITUDE", 0.35)
+    monkeypatch.setattr(cfg, "MIN_CONFIDENCE", 0.70)
+    monkeypatch.setattr(cfg, "LOTTO_MIN_MAGNITUDE", 0.35)
+    monkeypatch.setattr(cfg, "LOTTO_MIN_CONFIDENCE", 0.70)
+    monkeypatch.setattr(cfg, "TICKER_CORRECTOR_ENABLED", False)
+    monkeypatch.setattr(scoring, "score_article", lambda h, b, s: {
+        "sentiment": "bullish", "magnitude": 0.35, "confidence": 0.70, "tickers": ["AAPL"]})
+
+    fired = []
+    monkeypatch.setattr(ex, "execute_lotto", lambda t, s: fired.append(t))
+    asyncio.run(bot.process_signal("headline", "body", "test"))
+    assert fired == ["AAPL"]
+
+
+def test_lotto_thresholds_are_bound_to_the_global_pair():
+    """Aliases, not copies -- if these ever diverge, a signal could clear the pipeline gate and
+    then be silently dropped at dispatch, which is the exact two-gate confusion v2 removed."""
+    assert cfg.LOTTO_MIN_MAGNITUDE is cfg.MIN_MAGNITUDE
+    assert cfg.LOTTO_MIN_CONFIDENCE is cfg.MIN_CONFIDENCE
+    assert not hasattr(cfg, "CONFIDENCE_SLOPE"), "v1's sliding gate must stay gone from v2"
+
+
+def test_gate_drops_are_logged_but_throttled(monkeypatch, caplog):
+    """Regression guard for the 2026-07-29 diagnosis: both pre-scoring gates used to `return`
+    silently, making a fully gated bot look identical to a dead one in the log. They must now
+    leave a trace -- but throttled, since every incoming article hits them."""
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: False)
+    bot._gate_drop_counts.clear()
+
+    with caplog.at_level("INFO"):
+        for _ in range(bot.GATE_LOG_EVERY + 1):
+            asyncio.run(bot.process_signal("headline", "body", "test"))
+
+    gate_lines = [r.getMessage() for r in caplog.records if "regime gate" in r.getMessage()]
+    assert len(gate_lines) == 2, f"expected first + one throttled summary, got {gate_lines}"
+    assert bot._gate_drop_counts["regime gate: not in uptrend (long-only legs paused)"] == \
+        bot.GATE_LOG_EVERY + 1
+
+
+def test_market_closed_and_regime_drops_count_separately(monkeypatch, caplog):
+    """The two reasons must not share a counter -- otherwise a closed market masks the regime
+    state (the exact ambiguity this logging exists to remove)."""
+    bot._gate_drop_counts.clear()
+    monkeypatch.setattr(mkt, "market_is_open", lambda: False)
+    with caplog.at_level("INFO"):
+        asyncio.run(bot.process_signal("headline", "body", "test"))
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: False)
+    with caplog.at_level("INFO"):
+        asyncio.run(bot.process_signal("headline", "body", "test"))
+
+    assert bot._gate_drop_counts == {"market closed": 1,
+                                     "regime gate: not in uptrend (long-only legs paused)": 1}
 
 
 def test_lotto_entry_cutoff_blocks_scoring_when_lotto_is_the_only_leg(monkeypatch):
@@ -179,17 +271,19 @@ def test_lotto_peak_trailing_tiers_removed():
     assert cfg.LOTTO_SAME_DAY_EXIT is True
 
 
-def test_lotto_stop_loss_is_entry_anchored_not_peak_anchored():
-    """The whole point of the new rule vs. the old trail: the stop must not move up with the
-    peak. A trade that spiked to +50% then fell back to -10% must still trip the entry-anchored
-    20% stop's threshold check the same as a trade that never rallied at all."""
-    pos = {"entry_price": 1.00}
-    assert not mkt._lotto_stop_loss_hit(pos, 0.85)   # -15%, above the 20% stop
-    assert mkt._lotto_stop_loss_hit(pos, 0.80)        # exactly -20% -> triggers
-    assert mkt._lotto_stop_loss_hit(pos, 0.50)        # deep loss -> triggers
-    # peak_price is irrelevant to this check -- only entry_price and current mid matter
-    pos_after_spike = {"entry_price": 1.00, "peak_price": 1.50}
-    assert mkt._lotto_stop_loss_hit(pos_after_spike, 0.79)
+def test_lotto_stop_is_peak_anchored_reversing_the_old_entry_only_rule():
+    """DELIBERATE REVERSAL (2026-07-31). This test previously asserted the opposite -- that the
+    stop must NOT move with the peak. jeff's objection: with an entry-anchored stop nothing can
+    ever lift the exit above its opening level, so a winner can only be banked by holding to the
+    EOD close, and any rally round-trips (AMZN peaked +30.4%, stopped out -22.6%). The stop is now
+    max(entry floor, peak * (1 - LOTTO_TRAIL_PCT)) and MUST track the peak."""
+    flat = {"entry_price": 1.00, "peak_price": 1.00}
+    spiked = {"entry_price": 1.00, "peak_price": 1.50}
+    # identical current price, different history -> different stop. That IS the change.
+    assert mkt._lotto_stop_loss_hit(flat, 0.84)
+    assert not mkt._lotto_stop_loss_hit(spiked, 0.84) or mkt.lotto_stop_price(spiked) > \
+        mkt.lotto_stop_price(flat)
+    assert mkt.lotto_stop_price(spiked) > mkt.lotto_stop_price(flat)
 
 
 def test_lotto_same_day_exit_requires_same_calendar_date(monkeypatch):
@@ -227,3 +321,78 @@ def test_lotto_entry_cutoff_allows_positions_with_enough_runway(monkeypatch):
     monkeypatch.setattr(ex, "place_option_trade", lambda *a, **k: called.append(1))
     ex.execute_lotto("AAPL", {"magnitude": 0.9, "confidence": 0.9})
     assert called == [1], "must still open a position when there's enough runway before close"
+
+
+def test_daily_loss_limit_exceeds_a_single_stopout():
+    """Regression guard for 2026-07-31: DAILY_LOSS_LIMIT_PCT (0.02) was exactly equal to
+    LOTTO_POSITION_FRAC_OF_EQUITY * LOTTO_STOP_LOSS_PCT (0.10 * 0.20), so the day breaker fired on
+    the FIRST normal stop-out — it could never limit a bad *sequence*, only announce a bad trade.
+    The limit must stay a genuine multiple of the per-trade worst case."""
+    per_trade = cfg.LOTTO_POSITION_FRAC_OF_EQUITY * cfg.LOTTO_STOP_LOSS_PCT
+    assert cfg.DAILY_LOSS_LIMIT_PCT >= per_trade * 2, (
+        f"daily limit {cfg.DAILY_LOSS_LIMIT_PCT} is only "
+        f"{cfg.DAILY_LOSS_LIMIT_PCT / per_trade:.1f}x a single stop-out ({per_trade}) — "
+        f"one losing trade would halt the day")
+    assert cfg.DAILY_LOSS_MAX_STOPOUTS >= 2
+
+
+def test_lotto_stop_trails_the_peak_and_never_loosens():
+    """jeff's risk requirement (2026-07-31): the exit level must RISE as the contract gains. An
+    entry-anchored stop can never lift above its opening level, so the only route to profit is
+    holding to the EOD close. Stop = max(entry floor, peak * (1 - trail))."""
+    t = cfg.LOTTO_TRAIL_PCT
+    floor = 1.0 - cfg.LOTTO_STOP_LOSS_PCT
+    pos = {"entry_price": 1.00, "peak_price": 1.00}
+    # At entry the stop is whichever is TIGHTER of the trail and the entry floor. At the live
+    # trail of 0.15 the trail wins (0.85 > 0.80), so the floor is currently inert -- it only binds
+    # if the trail is ever set looser than LOTTO_STOP_LOSS_PCT.
+    assert mkt.lotto_stop_price(pos) == pytest.approx(max(floor, 1.0 - t))
+    for peak in (1.10, 1.25, 2.00, 4.00):
+        pos["peak_price"] = peak
+        assert mkt.lotto_stop_price(pos) == pytest.approx(max(floor, peak * (1 - t)))
+    # and it must rise monotonically with the peak
+    levels = []
+    for peak in (1.00, 1.10, 1.25, 2.00, 4.00):
+        levels.append(mkt.lotto_stop_price({"entry_price": 1.00, "peak_price": peak}))
+    assert levels == sorted(levels)
+
+
+def test_lotto_trailing_stop_beats_entry_anchored_on_the_real_amzn_path():
+    """Replay of the real 2026-07-31 quotes: entry 0.84, peak 1.095 (+30.4%), close 0.59. The live
+    entry-anchored rule exited at -22.6%; a trailing stop must exit materially higher."""
+    pos = {"entry_price": 0.84, "peak_price": 0.84}
+    exit_px = None
+    for mid in (0.815, 0.785, 0.84, 0.94, 1.01, 1.095, 1.00, 0.92, 0.87, 0.80, 0.70, 0.59):
+        pos["peak_price"] = max(pos["peak_price"], mid)
+        if mkt._lotto_stop_loss_hit(pos, mid):
+            exit_px = mid
+            break
+    assert exit_px is not None, "trailing stop never fired on a round-tripping path"
+    assert exit_px > 0.84 * 0.80, f"exited at {exit_px}, no better than the entry-anchored stop"
+
+
+def test_position_path_logging_writes_a_replayable_row(tmp_path, monkeypatch):
+    """Ported from v1 2026-07-31 so exit rules can be judged on REAL quotes. Before this, the only
+    record of a position's path was the 👁 log lines — the AMZN post-mortem had to regex 203 of
+    them out of bot.log, and they vanish on rotation."""
+    monkeypatch.chdir(tmp_path)
+    pos = {"strategy": "lotto", "asset_type": "option", "underlying": "AMZN",
+           "entry_price": 0.84, "peak_price": 1.095}
+    ex._log_position_path("AMZN260814C00295000", pos, 0.90, 7.14, 0.876)
+    ex._log_position_path("AMZN260814C00295000", pos, 0.88, 4.76, 0.876)
+    rows = (tmp_path / "position_paths.csv").read_text().strip().splitlines()
+    assert len(rows) == 3                                  # header + 2 samples
+    assert rows[0].startswith("ts,symbol,strategy")
+    cols = rows[1].split(",")
+    assert cols[1] == "AMZN260814C00295000" and cols[2] == "lotto"
+    assert float(cols[6]) == 0.9 and float(cols[7]) == 1.095   # mid, peak
+    assert float(cols[9]) == 0.876                             # stop travels with the row
+
+
+def test_position_path_logging_never_breaks_the_monitor(monkeypatch):
+    """Telemetry must fail silently — a full disk or a bad path can't be allowed to stop the
+    stop-loss checks that run in the same loop."""
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr("builtins.open", boom)
+    ex._log_position_path("X", {"entry_price": 1.0}, 1.0, 0.0, 0.8)   # must not raise

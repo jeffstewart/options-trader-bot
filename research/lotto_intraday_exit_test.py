@@ -17,6 +17,12 @@ evaluated at finer time steps), for the sonnet5 lotto candidate set (mag>=0.3, c
 n=41, 39% win, the best reasonably-sized cell from the selectivity grid).
 
 Usage:  USE_YAHOO_BARS=1 .venv/bin/python -u lotto_intraday_exit_test.py   (run from data/)
+
+UPDATED 2026-07-31: added exit_trailing_stop (jeff's live v2 rule: stop = max(entry floor,
+peak*(1-trail)), same-day EOD boundary), and FIXED a confound -- exit_eod_same_day /
+exit_eod_with_stop / exit_eod_with_lock did not apply the 3x hard cap that the live bot and the
+other rules do, so their total$ was inflated by riding winners past a level the bot would have
+sold at. Every rule now measures against the same live constraint.
 """
 import os, sys, statistics
 os.environ.setdefault("USE_YAHOO_BARS", "1")
@@ -41,6 +47,11 @@ hourly_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
 DELTA, DTE = 0.20, 14
 BUDGET = int(os.environ.get("LOTTO_TEST_BUDGET", "100"))
+# Live lotto takes profit at LOTTO_HARD_CAP_MULT x entry (3.0). Set LOTTO_TEST_CAP=0 to disable it
+# and measure what the cap itself is worth -- it exits 9 of 14 trades here, so it is the single
+# most influential rule in the file and every other comparison is conditional on it.
+_cap_env = float(os.environ.get("LOTTO_TEST_CAP", "3.0"))
+HARD_CAP = _cap_env if _cap_env > 0 else float("inf")
 NEWS_IV_MULT, IV_HALFLIFE = _cfg.__dict__.get("NEWS_IV_MULTIPLIER", 1.10), 3.0
 R = 0.04
 TIERED = [(1.0, 0.40), (3.0, 0.30), (float("inf"), 0.20)]   # current live tiered trail
@@ -111,7 +122,7 @@ def exit_tiered_3day(pv):
         stop = peak * (1 - trail)
         if prem <= stop:
             return prem, hrs, "trail-stop"
-        if prem >= 3.0 * entry:   # lotto hard profit cap (3x)
+        if prem >= HARD_CAP * entry:   # lotto hard profit cap (3x)
             return prem, hrs, "hard-cap"
     last = pv["path"][min(len(pv["path"]), int(72)) - 1] if pv["path"] else None
     final = next((p for h, t, x, p in pv["path"] if h <= 72), pv["path"][-1][3])
@@ -120,6 +131,34 @@ def exit_tiered_3day(pv):
             return p, h, "time-stop"
     return pv["path"][-1][3], pv["path"][-1][0], "time-stop"
 
+
+def exit_trailing_stop(pv, trail_pct, same_day_eod=True):
+    """v2's LIVE rule as of 2026-07-31 (jeff): stop = max(entry floor, peak * (1 - trail_pct)),
+    with the same-day EOD exit as the outer boundary.
+
+    This is the variant the original run never tested. Its stop-loss rows were EOD exits with a
+    static entry-anchored floor that fired once in 14 trades -- so the sweep measured the EOD rule,
+    not the stop. Here the stop moves continuously with the peak, so it should actually bind.
+    Floor stays at LOTTO_STOP_LOSS_PCT (0.20) so the worst case is unchanged.
+    """
+    entry = pv["entry_premium"]
+    peak = entry
+    floor = entry * (1 - 0.20)
+    entry_day = None
+    last = (pv["path"][0][3], pv["path"][0][0], "eod") if pv["path"] else (entry, 0, "eod")
+    for hrs, t, px, prem in pv["path"]:
+        if entry_day is None:
+            entry_day = t.date()
+        if same_day_eod and t.date() > entry_day:
+            return last[0], last[1], "eod-same-day"
+        peak = max(peak, prem)
+        stop = max(floor, peak * (1 - trail_pct))
+        if prem <= stop:
+            return prem, hrs, "trail-stop"
+        if prem >= HARD_CAP * entry:
+            return prem, hrs, "hard-cap"
+        last = (prem, hrs, "eod")
+    return last
 
 def exit_eod_same_day(pv):
     """Force-exit at the close of the SAME calendar day as entry (first bar >= 20:00 UTC, or the
@@ -131,6 +170,8 @@ def exit_eod_same_day(pv):
         if t.date() != entry_day:
             # crossed into the next day -- exit at the LAST bar we saw on the entry day
             break
+        if prem >= HARD_CAP * pv['entry_premium']:
+            return prem, hrs, 'hard-cap'
         last = (prem, hrs, "eod-same-day")
     return last if entry_day else exit_tiered_3day(pv)
 
@@ -170,6 +211,8 @@ def exit_eod_with_stop(pv, stop_loss_pct):
             break
         if prem <= stop:
             return prem, hrs, "stop-loss(intraday)"
+        if prem >= HARD_CAP * pv['entry_premium']:
+            return prem, hrs, 'hard-cap'
         last = (prem, hrs, "eod")
     return last
 
@@ -192,7 +235,7 @@ def exit_breakeven_lock(pv, lock_gain=0.10, tight_trail=0.15):
             stop = max(stop, entry * 1.01)   # never below breakeven once locked
         if prem <= stop:
             return prem, hrs, "breakeven-lock" if locked else "trail-stop"
-        if prem >= 3.0 * entry:
+        if prem >= HARD_CAP * entry:
             return prem, hrs, "hard-cap"
     for h, t, x, p in reversed(pv["path"]):
         if h <= 72:
@@ -209,6 +252,8 @@ def exit_eod_with_lock(pv, lock_gain=0.10, tight_trail=0.15):
     for hrs, t, px, prem in pv["path"]:
         if t.date() != entry_day:
             break
+        if prem >= HARD_CAP * pv['entry_premium']:
+            return prem, hrs, 'hard-cap'
         peak = max(peak, prem)
         gain = peak / entry - 1.0
         if gain >= lock_gain:
@@ -246,7 +291,8 @@ def main():
     print(f"candidate set: mag>=0.3 conf>=0.70 -> {len(gated)} signals (post-regime)")
 
     STOP_LOSSES = [0.15, 0.20, 0.25, 0.30, 0.35]
-    names = (["baseline_3d_tiered", "eod_same_day", "next_morning_90m", "breakeven_lock", "eod_with_lock"]
+    names = (["baseline_3d_tiered", "eod_same_day", "next_morning_90m", "breakeven_lock", "eod_with_lock",
+                "trail_15pct", "trail_20pct"]
               + [f"eod_stop_{int(s*100)}pct" for s in STOP_LOSSES])
     results = {n: [] for n in names}
     exit_reasons = {n: [] for n in names}
@@ -275,7 +321,9 @@ def main():
                    ("eod_same_day", exit_eod_same_day),
                    ("next_morning_90m", exit_next_morning),
                    ("breakeven_lock", exit_breakeven_lock),
-                   ("eod_with_lock", exit_eod_with_lock)]
+                   ("eod_with_lock", exit_eod_with_lock),
+                   ("trail_15pct", lambda pv: exit_trailing_stop(pv, 0.15)),
+                   ("trail_20pct", lambda pv: exit_trailing_stop(pv, 0.20))]
             for s in STOP_LOSSES:
                 fns.append((f"eod_stop_{int(s*100)}pct", lambda pv, s=s: exit_eod_with_stop(pv, s)))
             for name, fn in fns:

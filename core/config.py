@@ -214,11 +214,17 @@ MIN_MAGNITUDE    = 0.35
 
 # Confidence floor scales with magnitude: weaker catalyst -> higher conviction required.
 # Formula: required_confidence = BASE_CONFIDENCE + (1 - magnitude) * CONFIDENCE_SLOPE
-# At defaults:
-#   magnitude 1.0 -> need 0.55 confidence
-#   magnitude 0.7 -> need 0.63 confidence
-#   magnitude 0.5 -> need 0.68 confidence
-#   magnitude 0.35 (gate floor) -> need 0.71 confidence
+# At the CURRENT values (BASE 0.70 / SLOPE 0.25):
+#   magnitude 1.0  -> need 0.700 confidence
+#   magnitude 0.7  -> need 0.775 confidence
+#   magnitude 0.5  -> need 0.825 confidence
+#   magnitude 0.35 (gate floor) -> need 0.862 confidence
+# (This table read 0.55/0.63/0.68/0.71 until 2026-07-29 -- those were the BASE=0.55 numbers and
+# were never updated when BASE was raised to 0.70 on 2026-06-02, understating the strictest
+# requirement by 0.15. The stale table hid a real incompatibility: 0.71 sits comfortably under
+# sonnet5's observed max confidence of 0.85, but the true 0.862 sits ABOVE it -- i.e. this gate
+# rejects ~97% of sonnet5's bullish signals while passing ~78% of llama3.2's. These constants are
+# SCORER-SPECIFIC calibration, not universal risk settings; re-derive them on any scorer swap.)
 BASE_CONFIDENCE  = 0.70   # cross-regime tuned 2026-06-02 (was 0.55) — stricter gate
 CONFIDENCE_SLOPE = 0.25
 

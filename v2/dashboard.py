@@ -32,6 +32,7 @@ from alpaca.data.timeframe import TimeFrame
 from dotenv import load_dotenv
 
 import config as cfg
+import market as mkt
 
 load_dotenv()
 
@@ -42,11 +43,13 @@ TRADES_CSV        = Path("trades.csv")
 CLOSED_TRADES_CSV = Path("closed_trades.csv")
 BOT_STATE_FILE    = Path("bot_state.json")
 BOT_LOG           = cfg.LOG_DIR / "bot.log"
-BOT_PROCESS       = "v2/bot.py"
+COMPOSE_DIR       = Path(__file__).resolve().parent
 PORT              = int(os.environ.get("V2_DASHBOARD_PORT", 5002))
 
 trading_client = TradingClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET, paper=True)
 _data_client   = StockHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
+mkt.patch_request_timeout(trading_client, "dashboard-trading")
+mkt.patch_request_timeout(_data_client, "dashboard-stock-data")
 
 _bench_cache = {"ts": 0.0, "data": None}
 _BENCH_TTL = 300.0
@@ -55,10 +58,27 @@ _BENCH_TTL = 300.0
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def bot_is_running() -> bool:
+    """bot.py runs in a Docker container (docker-compose.yml), not as a bare host process --
+    a pgrep-for-the-script-path check (the pre-container approach) would always report "stopped"
+    now. Ask Docker Compose directly instead."""
     try:
-        return bool(subprocess.check_output(["pgrep", "-f", BOT_PROCESS], text=True).strip())
-    except subprocess.CalledProcessError:
+        cid = subprocess.check_output(
+            ["docker", "compose", "ps", "-q", "v2-bot"],
+            text=True, cwd=str(COMPOSE_DIR), stderr=subprocess.DEVNULL,
+        ).strip()
+        if not cid:
+            return False
+        state = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{.State.Running}}", cid],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        return state == "true"
+    except Exception:
         return False
+
+
+def get_regime() -> dict:
+    return mkt.regime_status()
 
 
 def get_account() -> dict:
@@ -279,7 +299,9 @@ def get_chart_data(window_days: int = 30) -> dict:
 
 # ── bot log parsing (v2's own log format -- singular `ticker=`, not v1's `tickers=[...]`) ──────
 
-_RE_TS       = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+(INFO|WARNING|ERROR|CRITICAL)\s+(.+)$")
+# Date prefix (MM-DD) added 2026-07-22 -- optional so lines written before that (bare HH:MM:SS,
+# still sitting in the tail window at the time of the switch) keep parsing instead of vanishing.
+_RE_TS       = re.compile(r"^(?:(\d{2}-\d{2}) )?(\d{2}:\d{2}:\d{2})\s+(INFO|WARNING|ERROR|CRITICAL)\s+(.+)$")
 _RE_ARTICLE  = re.compile(r"📰 \[(.+?)\] (.+)")
 _RE_LLM      = re.compile(r"🤖 \S+: (\w+)\s+conf=([\d.]+)\s+mag=([\d.]+)\s+ticker=(\S+)")
 _RE_TRADE    = re.compile(r"✅ (OPTION BUY|STOCK BUY)")
@@ -305,7 +327,8 @@ def parse_bot_log(tail_lines: int = 200) -> dict:
         m = _RE_TS.match(line.rstrip("\n"))
         if not m:
             continue
-        ts, level, msg = m.groups()
+        date_part, time_part, level, msg = m.groups()
+        ts = f"{date_part} {time_part}" if date_part else time_part
 
         if level in ("WARNING", "ERROR", "CRITICAL"):
             errors.append({"ts": ts, "level": level, "msg": msg[:300]})
@@ -359,6 +382,7 @@ def api_status():
         "bot_running": bot_is_running(),
         "account":     account,
         "benchmark":   get_benchmark(account),
+        "regime":      get_regime(),
         "positions":   positions,
         "trades":      get_recent_trades(30, positions),
         "stats":       get_stats(),
@@ -435,6 +459,18 @@ HTML = r"""<!DOCTYPE html>
   .strategy-pill { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px;
                    text-transform: uppercase; background: #4c1d5522; color: #ec4899; }
 
+  .gate-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 12px;
+                text-transform: uppercase; letter-spacing: .4px; }
+  .gate-badge.open { background: #16653422; color: var(--green); }
+  .gate-badge.blocked { background: #7f1d1d22; color: var(--red); }
+  .gate-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .gate-row:last-child { border-bottom: none; }
+  .gate-check { font-weight: 700; width: 16px; text-align: center; flex-shrink: 0; }
+  .gate-check.pass { color: var(--green); } .gate-check.fail { color: var(--red); }
+  .gate-label { flex: 1; }
+  .gate-detail { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
+  .gate-need { font-size: 12px; color: var(--yellow); margin-top: 6px; padding-top: 8px; border-top: 1px dashed var(--border); }
+
   .feed { display: flex; flex-direction: column; gap: 0; }
   .feed-item { display: flex; align-items: baseline; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
   .feed-item:last-child { border-bottom: none; }
@@ -470,7 +506,14 @@ HTML = r"""<!DOCTYPE html>
   .log-controls label { font-size: 12px; color: var(--muted); }
   .log-controls input[type=checkbox] { accent-color: var(--accent); }
   .log-controls select { background: var(--border); color: var(--text); border: none; border-radius: 6px; padding: 3px 8px; font-size: 12px; }
-</style>
+
+    .gate-strip { display:flex; align-items:center; gap:3px; margin:-2px 0 8px 26px; flex-wrap:wrap; }
+    .gate-strip-cap { font-size:10px; color:var(--muted); }
+    .gate-day { display:inline-block; width:11px; height:16px; border-radius:2px; opacity:.85; }
+    .gate-day:hover { opacity:1; }
+    .gate-strip-eta { font-size:11px; color:#f59e0b; margin-left:6px; }
+    .gate-strip-ok { font-size:11px; color:var(--green); margin-left:6px; }
+    </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -483,6 +526,14 @@ HTML = r"""<!DOCTYPE html>
 </header>
 
 <main>
+  <div class="card" id="regimeCard">
+    <div class="card-title-row">
+      <div class="card-title">Trading Gate</div>
+      <span id="regimeBadge" class="gate-badge">—</span>
+    </div>
+    <div id="regimeBody"><div class="empty">Loading…</div></div>
+  </div>
+
   <div class="grid-2" style="margin-bottom:12px">
     <div class="card" style="margin-bottom:0">
       <div class="card-title">Today's P&amp;L</div>
@@ -532,12 +583,12 @@ HTML = r"""<!DOCTYPE html>
 
   <div class="two-col">
     <div class="card" style="margin-bottom:0">
-      <div class="card-title">Activity Feed</div>
+      <div class="card-title">Activity Feed (times UTC)</div>
       <div class="feed" id="feedWrap"><div class="empty">Loading…</div></div>
     </div>
     <div class="card" style="margin-bottom:0">
       <div class="card-title-row">
-        <div class="card-title">Errors &amp; Warnings</div>
+        <div class="card-title">Errors &amp; Warnings (times UTC)</div>
         <span class="err-count" id="errCount" style="display:none"></span>
       </div>
       <div id="errWrap"><div class="empty">No errors</div></div>
@@ -556,7 +607,7 @@ HTML = r"""<!DOCTYPE html>
 
   <div class="card">
     <div class="card-title-row">
-      <div class="card-title">Bot Log</div>
+      <div class="card-title">Bot Log (times UTC)</div>
       <div class="log-controls">
         <label><input type="checkbox" id="logAutoScroll" checked> Auto-scroll</label>
         <select id="logLines" onchange="fetchLog()">
@@ -578,6 +629,72 @@ const fmtP = n => (n>=0?"+":"")+n.toFixed(2)+"%";
 const esc  = s => (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 function colorClass(n) { return n > 0 ? "pos" : n < 0 ? "neg" : "neu"; }
 function stratPill(s) { return `<span class="strategy-pill">${esc(s||"lotto")}</span>`; }
+
+function renderRegime(r) {
+  const badge = document.getElementById("regimeBadge");
+  if (!r || r.enabled === false) {
+    badge.textContent = "FILTER OFF"; badge.className = "gate-badge open";
+    return '<div class="empty">Regime filter disabled — not gating trades.</div>';
+  }
+  if (r.error) {
+    badge.textContent = "CHECK FAILED"; badge.className = "gate-badge open";
+    return `<div class="empty">Regime check failed (${esc(r.error)}) — defaulting to allow trades until this clears.</div>`;
+  }
+  if (r.insufficient_data) {
+    badge.textContent = "WARMING UP"; badge.className = "gate-badge open";
+    return `<div class="empty">Only ${r.bars} of ${r.bars_needed} days of history available — defaulting to allow trades.</div>`;
+  }
+
+  badge.textContent = r.uptrend ? "Trading enabled" : "Blocked";
+  badge.className = "gate-badge " + (r.uptrend ? "open" : "blocked");
+
+  const rows = [];
+  const gapPct = (r.price / r.sma - 1) * 100;
+  rows.push({
+    ok: r.above_sma,
+    label: `${r.index} above ${r.sma_days}d SMA`,
+    detail: `$${r.price.toFixed(2)} vs $${r.sma.toFixed(2)} (${gapPct>=0?"+":""}${gapPct.toFixed(1)}%)`,
+    need: r.above_sma ? null : `${r.index} needs to close ${Math.abs(gapPct).toFixed(1)}% higher, above $${r.sma.toFixed(2)}`,
+  });
+  if (r.mom_price_then != null) {
+    const momPct = (r.price / r.mom_price_then - 1) * 100;
+    rows.push({
+      ok: r.mom_ok,
+      label: `Momentum (vs ${r.mom_days}d ago)`,
+      detail: `$${r.price.toFixed(2)} vs $${r.mom_price_then.toFixed(2)} (${momPct>=0?"+":""}${momPct.toFixed(1)}%)`,
+      need: r.mom_ok ? null : `${r.index} needs to get back above its price from ${r.mom_days} days ago ($${r.mom_price_then.toFixed(2)}, ${Math.abs(momPct).toFixed(1)}% away)`,
+    });
+  }
+  rows.push({
+    ok: r.chop_ok,
+    label: `Chop (down-days, last ${r.dd_window}d)`,
+    detail: `${(r.dd_density*100).toFixed(0)}% vs ${(r.dd_max*100).toFixed(0)}% max`,
+    need: r.chop_ok ? null : `Down-day density needs to drop under ${(r.dd_max*100).toFixed(0)}% over the trailing ${r.dd_window} days (currently ${(r.dd_density*100).toFixed(0)}%)`,
+    extra: (r.dd_days && r.dd_days.length) ? `<div class="gate-strip">
+      <span class="gate-strip-cap">older</span>
+      ${r.dd_days.map(d => `<span class="gate-day" title="${d.date} · ${d.down?'down':'up'} ${d.pct>=0?'+':''}${d.pct}%" style="background:${d.down?'var(--red)':'var(--green)'}"></span>`).join('')}
+      <span class="gate-strip-cap">newer</span>
+      ${r.dd_sessions_to_clear > 0
+         ? `<span class="gate-strip-eta">≥${r.dd_sessions_to_clear} up-session${r.dd_sessions_to_clear>1?'s':''} to clear chop</span>`
+         : `<span class="gate-strip-ok">chop clear</span>`}
+    </div>` : "",
+  });
+
+  let html = "";
+  for (const row of rows) {
+    html += `<div class="gate-row">
+      <span class="gate-check ${row.ok?'pass':'fail'}">${row.ok?'✓':'✗'}</span>
+      <span class="gate-label">${row.label}</span>
+      <span class="gate-detail">${row.detail}</span>
+    </div>`;
+    if (row.extra) html += row.extra;
+  }
+  const needs = rows.filter(x => x.need).map(x => x.need);
+  if (needs.length) {
+    html += `<div class="gate-need">To resume: ${needs.join(" · ")}</div>`;
+  }
+  return html;
+}
 
 function renderPositions(positions) {
   if (!positions.length) return '<div class="empty">No open positions</div>';
@@ -699,6 +816,8 @@ async function refresh() {
 
     document.getElementById("statusDot").className = "dot " + (data.bot_running ? "green" : "red");
     document.getElementById("statusText").textContent = data.bot_running ? "Bot running" : "Bot stopped";
+
+    document.getElementById("regimeBody").innerHTML = renderRegime(data.regime);
 
     const a = data.account || {};
     if (a.equity !== undefined) {
