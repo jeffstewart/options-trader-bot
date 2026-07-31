@@ -396,3 +396,35 @@ def test_position_path_logging_never_breaks_the_monitor(monkeypatch):
         raise OSError("disk full")
     monkeypatch.setattr("builtins.open", boom)
     ex._log_position_path("X", {"entry_price": 1.0}, 1.0, 0.0, 0.8)   # must not raise
+
+
+def test_halt_blocks_scoring_before_the_paid_call(monkeypatch):
+    """2026-07-31: the daily-loss halt lived only inside execute_lotto, so v2 made 4 paid Sonnet
+    calls in the 23 minutes after halting — scoring articles that could not possibly trade. The
+    most absolute gate in the pipeline must sit ahead of the scorer, like every other one."""
+    monkeypatch.setattr(mkt, "market_is_open", lambda: True)
+    monkeypatch.setattr(mkt, "market_in_uptrend", lambda: True)
+    monkeypatch.setattr(mkt, "trading_halted", lambda: True)
+    called = []
+    monkeypatch.setattr(scoring, "score_article", lambda h, b, s: called.append(1) or None)
+
+    asyncio.run(bot.process_signal("Some bullish headline", "body", "test"))
+    assert called == [], "scorer must not be called once the daily loss limit has halted trading"
+
+
+def test_halt_check_is_cheap_when_no_loss_booked(monkeypatch):
+    """It runs on every inbound news item, so it must not hit the account-equity endpoint unless a
+    loss has actually been booked today."""
+    monkeypatch.setattr(mkt, "_daily_loss_usd", 0.0)
+    monkeypatch.setattr(mkt, "_trading_halted", False)
+    fetched = []
+    monkeypatch.setattr(mkt, "account_equity", lambda: fetched.append(1) or 1000.0)
+    assert mkt.trading_halted() is False
+    assert fetched == [], "equity was fetched despite no loss being booked"
+
+
+def test_guardrails_and_process_signal_share_one_halt_rule(monkeypatch):
+    """passes_guardrails must delegate to trading_halted() — two independent copies of the rule
+    would let the pre-score gate and the pre-order gate disagree."""
+    monkeypatch.setattr(mkt, "trading_halted", lambda: True)
+    assert mkt.passes_guardrails({"mid": 1.0, "spread_pct": 0.05}) is False

@@ -508,18 +508,37 @@ def lotto_budget_usd() -> float:
     return eq * cfg.LOTTO_POSITION_FRAC_OF_EQUITY
 
 
-def passes_guardrails(quote: dict, skip_halt: bool = False) -> bool:
+def trading_halted() -> bool:
+    """Is the daily-loss breaker tripped? THE single owner of that decision -- passes_guardrails
+    delegates here so the rule can't drift between the two call sites.
+
+    Exposed so bot.process_signal can check it BEFORE paying for a scoring call. The halt used to
+    be evaluated only inside execute_lotto, i.e. AFTER the scorer had already run, so on
+    2026-07-31 v2 made 4 paid Sonnet calls in the 23 minutes after halting -- scoring articles that
+    could not possibly trade. Same mistake as the lotto entry cutoff (hoisted 2026-07-18 for the
+    same reason): every cheap, absolute "no trade is possible" gate belongs ahead of the paid call.
+
+    Cheap to call on every news item: short-circuits before account_equity() unless a loss has
+    actually been booked today, and that fetch is itself TTL-cached.
+    """
     global _trading_halted
+    _loss_reset_if_new_day()
+    if _trading_halted:
+        return True
+    if _daily_loss_usd <= 0:            # no losses booked -> cannot be halted, skip the equity call
+        return False
+    limit = _daily_loss_limit()
+    if _daily_loss_usd >= limit:
+        _trading_halted = True
+        log.warning("🛑 Daily loss limit hit ($%.0f >= $%.0f). Halting until next UTC day.",
+                    _daily_loss_usd, limit)
+        return True
+    return False
+
+
+def passes_guardrails(quote: dict, skip_halt: bool = False) -> bool:
     if not skip_halt:
-        _loss_reset_if_new_day()
-        limit = _daily_loss_limit()
-        if _trading_halted:
-            log.warning("🛑 Trading halted — daily loss limit reached ($%.0f)", limit)
-            return False
-        if _daily_loss_usd >= limit:
-            _trading_halted = True
-            log.warning("🛑 Daily loss limit hit ($%.0f >= $%.0f). Halting until next UTC day.",
-                        _daily_loss_usd, limit)
+        if trading_halted():
             return False
     if quote["spread_pct"] > cfg.MAX_SPREAD_PCT:
         log.info("  → spread too wide: %.1f%% > %.0f%% max — skipping", quote["spread_pct"] * 100, cfg.MAX_SPREAD_PCT * 100)

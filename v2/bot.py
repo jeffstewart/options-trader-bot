@@ -88,6 +88,13 @@ async def process_signal(headline: str, body: str, source: str, symbols: list[st
         _log_gate_drop("regime gate: not in uptrend (long-only legs paused)")
         return
 
+    # Daily-loss breaker, checked BEFORE the paid scorer (2026-07-31). It is the most absolute
+    # gate in the pipeline -- once tripped, nothing can trade until the next UTC day -- but it used
+    # to be evaluated only inside execute_lotto, after scoring had already been paid for.
+    if mkt.trading_halted():
+        _log_gate_drop("daily loss limit reached — halted until next UTC day")
+        return
+
     # ── Pre-score filters (free, headline-only) ─────────────────────────────────────────────
     if cfg.PRESCORE_FILTER_ENABLED:
         from filters import prescore_noise
