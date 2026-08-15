@@ -709,6 +709,64 @@ MATERIALITY_GATE_ENABLED   = False
 ROUTER_SHADOW_ENABLED = True
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CONTRACT-GRID COLLECTOR (jeff, 2026-08-XX)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data collection for the contract-picking research project (research/spread_cap_log_mining.py,
+# research/liquidity_first_pick_dryrun.py). For every sufficiently-bullish signal, snapshot
+# quotes+greeks for a WIDE grid of strikes/expiries at signal time -- not just the one contract
+# the live bot would trade -- then keep re-snapshotting the same contracts on a decaying cadence
+# through each contract's own expiry (deliberately longer than any current exit rule would hold a
+# real position, so the data can validate exit logic too, not just entry contract selection). Pure
+# market-data reads; no orders, no capital, no dedicated account needed.
+#
+# Lives in v1, not v2 (jeff's call, 2026-08-XX): v1 scores every article that reaches it with the
+# free local Ollama scorer regardless of whether it will trade, while v2 deliberately filters BEFORE
+# the paid scorer to avoid spending money on signals that can't trade -- v1 is the wider-coverage
+# hook point for a "log more than what currently trades" research collector.
+GRID_COLLECTOR_ENABLED = os.environ.get("GRID_COLLECTOR_ENABLED", "true").lower() == "true"
+
+# mag*confidence >= 0.13 -- derived from data/unified_scores.json's unified_v1/Ollama-scored bullish
+# population (n=3,145), the SAME scorer+prompt v1 runs live. NOT the same value as v2 would use:
+# Ollama's well-documented confidence-collapse (project_llama_confidence_collapse memory) means its
+# mag*conf distribution is clustered into a few discrete bands rather than a smooth curve -- there
+# is no threshold that lands on exactly 90% coverage. 0.13 is the closest achievable (88.1% of
+# historical bullish signals clear it; the nearest neighboring values jump to 96.2% at 0.12 or down
+# to 85.1% at 0.22, so 0.13 is a genuine local optimum, not an arbitrary round number). Still far
+# looser than the live trade gate (sliding BASE_CONFIDENCE+CONFIDENCE_SLOPE formula, effectively
+# ~0.55-0.60 product for most magnitudes) -- the point is the same as in v2: log enough to evaluate
+# whether the trade threshold itself is right, not just how well the bot picks a contract among
+# signals that already passed it.
+GRID_LOG_THRESHOLD = float(os.environ.get("GRID_LOG_THRESHOLD", "0.13"))
+
+# Wide enough to cover BOTH news_call (DTE 14-21 @ ~0.50 delta, near ATM) and lotto (DTE 8-21 @
+# ~0.25 delta, further OTM) with room on both sides to question whether either window is right.
+GRID_DTE_MIN = int(os.environ.get("GRID_DTE_MIN", "3"))
+GRID_DTE_MAX = int(os.environ.get("GRID_DTE_MAX", "30"))
+GRID_STRIKE_LO_MULT = float(os.environ.get("GRID_STRIKE_LO_MULT", "0.85"))
+GRID_STRIKE_HI_MULT = float(os.environ.get("GRID_STRIKE_HI_MULT", "1.25"))
+
+# Tracks LONGER than any current exit rule would hold a real position, capped at GRID_MAX_TRACK_DAYS
+# as a backstop, so the dataset can validate/challenge exit logic (stop level, EOD forced exit, hold
+# duration) as well as entry contract selection.
+GRID_MAX_TRACK_DAYS = int(os.environ.get("GRID_MAX_TRACK_DAYS", "32"))
+
+# Decaying poll cadence: dense early (matches position_paths.csv's 30s cadence -- most of the
+# news-driven move happens in the first several minutes) then progressively sparser. jeff's call
+# (2026-08-XX): capped the long end at 30 min, not the 2hr originally proposed -- more collection
+# volume, but 2hr was judged too coarse to be useful granularity for the later part of a hold.
+# (max_minutes_since_signal, poll_interval_seconds) -- first tuple whose bound isn't exceeded wins.
+# The poller additionally skips entirely while the market is closed (see grid_collector.py) --
+# quotes don't move overnight/weekends, so those hours would just waste API calls for zero signal.
+GRID_POLL_SCHEDULE = [
+    (15,     30),          # 0-15 min: every 30s
+    (60,     180),         # 15-60 min: every 3 min
+    (6*60,   900),         # 1-6 hrs (rest of signal day): every 15 min
+    (999999, 1800),        # beyond day 1, through expiry: every 30 min (market hours only)
+]
+
+GRID_SNAPSHOT_CSV = "contract_grid_snapshots.csv"
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BACKTEST-ONLY PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════════
 

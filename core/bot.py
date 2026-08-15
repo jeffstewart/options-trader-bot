@@ -29,6 +29,7 @@ import feedparser
 import numpy as np
 import requests
 import sec_edgar
+import grid_collector
 from openai import OpenAI, RateLimitError
 from pricing import implied_vol_call
 from alpaca.data.live import NewsDataStream, StockDataStream
@@ -94,6 +95,8 @@ from config import (
     REGIME_BYPASS_MIN_MAGNITUDE,
     SEC_RSS_URL, SEC_POLL_SECS, SEC_USER_AGENT,
     NEWSAPI_URL, NEWSAPI_POLL_SECS, NEWSAPI_PARAMS,
+    GRID_COLLECTOR_ENABLED, GRID_LOG_THRESHOLD, GRID_DTE_MIN, GRID_DTE_MAX,
+    GRID_STRIKE_LO_MULT, GRID_STRIKE_HI_MULT,
 )
 
 load_dotenv()
@@ -3330,6 +3333,17 @@ async def process_signal(headline: str, body: str, source: str,
         log.info("  → neutral/unknown sentiment, skipping")
         return
 
+    # Contract-grid research collector (2026-08-XX): deliberately BEFORE signal_checks() below, so
+    # it sees ~88% of historically-bullish signals rather than just what clears today's trade
+    # threshold — the point is to also evaluate whether that threshold itself is right, not just
+    # how well the bot picks a contract among signals that already passed it. Fire-and-forget:
+    # must never slow or block the trade path below. See core/grid_collector.py.
+    if GRID_COLLECTOR_ENABLED and grid_collector.should_collect(signal):
+        grid_tickers = [t for t in (signal.get("tickers") or []) if t not in ("BTC", "ETH")]
+        if grid_tickers:
+            asyncio.create_task(grid_collector.start_collection(
+                grid_tickers[0], signal, headline, source, get_stock_price))
+
     passes, magnitude, req_conf = signal_checks(signal)
     if not passes:
         return
@@ -3860,6 +3874,13 @@ async def main():
         asyncio.create_task(_supervised(sec_rss_poller,            "SEC RSS poller")),
         asyncio.create_task(_supervised(newsapi_poller,            "NewsAPI poller")),
     ]
+    if GRID_COLLECTOR_ENABLED:
+        tasks.append(asyncio.create_task(_supervised(
+            lambda: grid_collector.run_poll_loop(market_is_open), "grid collector poll loop")))
+        log.info("📊 Contract-grid collector: ON (mag*conf>=%.3f, DTE %d-%d, strikes %.2fx-%.2fx)",
+                  GRID_LOG_THRESHOLD, GRID_DTE_MIN, GRID_DTE_MAX, GRID_STRIKE_LO_MULT, GRID_STRIKE_HI_MULT)
+    else:
+        log.info("📊 Contract-grid collector: OFF (config.GRID_COLLECTOR_ENABLED)")
 
     # ── Graceful shutdown (2026-07-17) ───────────────────────────────────────────────────────
     # manage.sh sends SIGTERM via pkill, and with NO handler Python's default disposition kills
