@@ -55,6 +55,7 @@ DEFAULT_NS = [25, 50, 100, 150]
 # reference -- it is the configuration v2 actually ran, on a different prompt.
 SOURCES = [
     ("kimi-k2.6",        "kimi_backtest_cache.json",     "k2.6"),
+    ("kimi-k3",          "kimi_backtest_cache.json",     "k3"),
     ("sonnet5",          "anthropic_backtest_cache.json", "sonnet5"),
     ("ollama-t0.1-ap",   "ollama_temp_cache.json",       "t01"),
     ("ollama-t1.0-ap",   "ollama_temp_cache.json",       "t10"),
@@ -100,7 +101,7 @@ def load_rows(cache_file: str, prefix: str, end_dt, days: int) -> list[dict]:
         if not (0.0 <= mag <= 1.0 and 0.0 <= conf <= 1.0):
             continue
         rows.append({"created_at": created_at, "magnitude": mag, "confidence": conf,
-                     "tickers": tickers})
+                     "tickers": tickers, "hash": ck})
     rows.sort(key=lambda r: r["created_at"])
     return rows
 
@@ -145,9 +146,85 @@ def load_unified_rows(prompt: str, end_dt, days: int, restrict: set) -> list[dic
         if not (0.0 <= mag <= 1.0 and 0.0 <= conf <= 1.0):
             continue
         rows.append({"created_at": created_at, "magnitude": mag,
-                     "confidence": conf, "tickers": tickers})
+                     "confidence": conf, "tickers": tickers, "hash": ck})
     rows.sort(key=lambda r: r["created_at"])
     return rows
+
+
+def select_ordered(rows: list[dict], reg, target_n: int, rank: str) -> list[dict]:
+    """Same walk as simulate_top_n (score-ranked, regime-filtered, deduped by day+ticker, must have
+    a tradeable price), but returns the picked ROWS in rank order instead of simulated trades. Top-n
+    is a strict prefix of top-(n+k) under this deterministic ranking, so one pass at the largest
+    requested n covers every smaller n."""
+    key = {"magconf": lambda r: r["magnitude"] * r["confidence"],
+           "mag":     lambda r: r["magnitude"],
+           "conf":    lambda r: r["confidence"]}[rank]
+    ranked = sorted(rows, key=key, reverse=True)
+    picked, seen = [], set()
+    for r in ranked:
+        if len(picked) >= target_n:
+            break
+        d = r["created_at"].date()
+        if reg and not reg(d):
+            continue
+        tk = r["tickers"][0]
+        if not _bt.is_valid_stock_ticker(tk):
+            continue
+        dedupe = f"{d}_{tk}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        sp = _bt.get_price_at(tk, r["created_at"])
+        if not sp:
+            continue
+        picked.append(r | {"dedupe": dedupe})
+    return picked
+
+
+def overlap_report(loaded: dict, reg, ns: list[int], rank: str) -> None:
+    """How many of each model's top-n picks are shared vs unique to one model. Answers jeff's
+    question directly: agreement isn't about raw bullish calls (those pools differ 4x in size),
+    it's about which specific date+ticker signals each model's OWN ranking surfaces into its
+    top-n trades."""
+    max_n = max(ns)
+    ordered = {label: select_ordered(rows, reg, max_n, rank) for label, rows in loaded.items()}
+
+    for n in ns:
+        print(f"\n{'=' * 88}\nOVERLAP AT top-{n} (ranked by {rank})\n{'=' * 88}")
+        keysets = {}
+        for label, picks in ordered.items():
+            if len(picks) < n * 0.9:
+                print(f"  (skipping {label}: only {len(picks)} tradeable picks, starved before n={n})")
+                continue
+            keysets[label] = {p["dedupe"] for p in picks[:n]}
+        if len(keysets) < 2:
+            print("  not enough models with full pools to compare")
+            continue
+
+        labels = sorted(keysets)
+        all_keys = set().union(*keysets.values())
+        counts = {k: sum(1 for lbl in labels if k in keysets[lbl]) for k in all_keys}
+        unanimous = sum(1 for c in counts.values() if c == len(labels))
+        majority = sum(1 for c in counts.values() if c > len(labels) / 2)
+        once = sum(1 for c in counts.values() if c == 1)
+        print(f"  models compared: {', '.join(labels)}")
+        print(f"  distinct trades across all models: {len(all_keys)}")
+        print(f"  unanimous (picked by all {len(labels)}): {unanimous}")
+        print(f"  majority (picked by > half): {majority}")
+        print(f"  picked by exactly one model: {once}")
+
+        print(f"\n  pairwise overlap (shared / smaller pool size):")
+        header = "".ljust(22) + "".join(f"{l[:10]:>12}" for l in labels)
+        print(f"  {header}")
+        for a in labels:
+            row = f"  {a[:20]:<20}  "
+            for b in labels:
+                if a == b:
+                    row += f"{'--':>12}"
+                else:
+                    shared = len(keysets[a] & keysets[b])
+                    row += f"{shared:>8}/{min(len(keysets[a]), len(keysets[b])):<3}"
+            print(row)
 
 
 def simulate_top_n(rows: list[dict], reg, target_n: int, rank: str) -> list[dict]:
@@ -236,6 +313,8 @@ def main():
     ap.add_argument("--prompt-ab", action="store_true",
                     help="llama3.2 unified_v1 vs anthropic_scorer prompt: same model, same "
                          "temperature 0.1, same articles, only the prompt differs")
+    ap.add_argument("--overlap", action="store_true",
+                    help="report agreement/disagreement between models' top-n picks instead of P&L")
     args = ap.parse_args()
 
     _, end_dt, days, _ = nc.BULL
@@ -278,6 +357,10 @@ def main():
     print(f"\nBullish signals available in window ({days}d to {end_dt.date()}), ranked by {args.rank}:")
     for label, rows in loaded.items():
         print(f"   {label:<22} {len(rows):>5}")
+
+    if args.overlap:
+        overlap_report(loaded, reg, args.n, args.rank)
+        return
 
     run_tables(loaded, reg, args)
 
