@@ -1,13 +1,21 @@
-# News-Driven Options Trading Bot
+# Trader Bot
 
-An event-driven bot that reacts to financial news in real time, scores each headline with a **local
-LLM**, gates the strongest bullish signals through an **independent cloud confirm/veto model**, and
-trades **long call options** on equities + ETFs via **Alpaca paper trading**. Options-only (crypto
-removed). Paper account — for research/education, not real money.
+Two independent event-driven options bots trading Alpaca **paper** accounts. Both react to
+financial news in real time, score it with an LLM, and trade options. Paper trading only — for
+research/education, not real money.
+
+- **`core/` (v1)** — the original, full-featured bot. Parses every article, runs a local Ollama
+  scorer + cloud confirm/veto gate, and trades `news_call`/`lotto`/`pead`/`pairs`. Also hosts the
+  contract-grid research collector (see below). Runs natively on the host.
+- **`v2/`** — a lean rewrite aimed at an eventual small real-money account. Runs independently of
+  v1 on its own paper account/book. Currently **lotto-only** — see [`v2/README.md`](v2/README.md).
+  Runs in a Docker container (bot) + native dashboard.
+
+Both are managed together via [`everything.sh`](everything.sh) (see Running, below).
 
 ---
 
-## How it works
+## v1 (`core/`) — how it works
 
 ```
 Alpaca/Benzinga news stream  +  SEC EDGAR 8-K RSS  +  NewsAPI
@@ -22,76 +30,110 @@ Alpaca/Benzinga news stream  +  SEC EDGAR 8-K RSS  +  NewsAPI
         ▼
  (3) Ollama scorer            local llama3.2 → {sentiment, magnitude, confidence, tickers}   (free, fast)
         │
- (4) signal checks            magnitude / confidence gates, cooldown, liquidity
+ (4) grid collector tap       mag×conf ≥ 0.13 → fire-and-forget contract-grid snapshot (research only,
+        │                       see below) — runs BEFORE the trade-eligibility checks below it
+        │
+ (5) signal checks            magnitude / confidence gates, cooldown, liquidity
         ▼
- (5) regime gate              long-beta paused when SPY < 200d SMA or < 3-day momentum…
-        │                       …EXCEPT the high-conviction BYPASS (magnitude ≥ REGIME_BYPASS_MIN_MAGNITUDE)
+ (6) regime gate              long-beta paused when SPY < 200d SMA, < 3-day momentum, or the chop
+        │                       brake trips (down-day density ≥60% over the last 10 SPY sessions)…
+        │                       …EXCEPT the high-conviction BYPASS (currently DISABLED, see below)
         ▼
- (6) confirm/veto gate        mistral-large independently re-scores the SAME article (unified_v1 prompt):
+ (7) confirm/veto gate        mistral-large independently re-scores the SAME article (unified_v1 prompt):
         │                       • confirm (bullish & mag ≥ GEMINI_CONFIRM_MIN_MAGNITUDE) → trade for real
         │                       • veto                                                  → shadow-only, no trade
         │                       • cap / error                                           → fall back to Ollama
         ▼
- (7) option legs              pick ~0.40-delta / ~10-DTE call → in-process trailing-stop monitor → exit
+ (8) option legs               pick ~0.50-delta / 14-21-DTE call → in-process trailing-stop monitor → exit
 ```
 
 The pre-score filters and the regime/gate logic exist because the model **systematically over-scores
 certain weak catalysts** (analyst notes, index inclusions, sector ETFs) to high magnitude. The
 deterministic filters drop the known-bad categories cheaply; the **mistral-large gate** is the
-learned second opinion that catches the rest (it independently judged 6 of 7 vetoes correct on its
-first live day). Both were validated with bootstrapped backtests (see `research/`).
+learned second opinion that catches the rest. Both were validated with bootstrapped backtests (see
+`research/`).
 
----
+The high-conviction regime **bypass is currently disabled** (`REGIME_BYPASS_MIN_MAGNITUDE=1.01`,
+effectively unreachable) — live forward data contradicted the backtest that justified it (see
+`docs/HANDOFF.md`).
 
-## Scoring stack
+### Scoring stack (v1)
 
 | Role | Model | Where | Notes |
 |---|---|---|---|
 | **Primary scorer** | `llama3.2` | local Ollama | scores every article; free, ~3–8s |
 | **Confirm/veto gate** | `mistral-large` | Mistral API | re-scores real-trade-eligible bullish signals; ~2.7s |
-| **A/B shadow** | `llama-3.3-70b` (Groq) | shadow only | logged to `scorer_ab.csv`, never trades — data for a possible cloud-primary move |
+| **A/B shadow** | Groq (configurable, currently off) | shadow only | logged to `scorer_ab.csv`, never trades |
 
-Why a gate instead of a better primary? Magnitude is **uncalibrated** — no model (incl. frontier)
-ranks it better than local llama. But a *different-family* model used as a **disagreement gate** does
-add value (it catches losers the primary over-hypes). See `docs/HANDOFF.md` for the full findings.
+Magnitude is **uncalibrated** — no model (incl. frontier) ranks it better than local llama. But a
+*different-family* model used as a **disagreement gate** does add value (it catches losers the
+primary over-hypes). See `docs/HANDOFF.md` for the full findings.
 
----
+### Strategies (v1)
 
-## Strategies
-
-- **`news_call`** — long calls on bullish single-name catalysts (the core strategy).
-- **`lotto`** — cheap far-OTM calls on very high-conviction events.
+- **`news_call`** — long calls on bullish single-name catalysts.
+- **`lotto`** — cheap far-OTM calls on very high-conviction events; late-day entry cutoff (30 min
+  before close).
 - **`pead`** — post-earnings-announcement drift (reserved position budget).
-- **`pairs`** — market-neutral long/short equity pairs; **runs in all regimes** (carries down days when the directional book is paused).
-- Shadow/off: `stock`, `bear_short`, `qqq_macro` (paper-tracked, not live).
+- **`pairs`** — market-neutral long/short equity pairs; **runs in all regimes** (carries down days
+  when the directional book is paused).
+- Shadow/off: `stock` (`STOCK_ENABLED=False`, real entries off), `bear_short`, `qqq_macro`.
+
+### Contract-grid research collector (v1 only)
+
+For every signal that clears `mag×conf ≥ GRID_LOG_THRESHOLD` (0.13 — the closest achievable
+approximation of "90% of historically-bullish signals" on Ollama's clustered confidence
+distribution; see `core/config.py` comments), regardless of whether it goes on to trade, the bot
+snapshots bid/ask/greeks/OI for a wide DTE×strike grid of real contracts and re-polls that grid on
+a decaying schedule (30s → 3min → 15min → 30min) through each contract's own expiry. Purely
+market-data reads — no orders, no capital. Output: `data/contract_grid_snapshots.csv`. Goal: enough
+data to evaluate the contract-picking logic (which of the available strikes/expiries would have
+performed best) and the exit logic (how far past today's sell point contracts kept moving),
+independent of what the bot actually happened to trade. See `core/grid_collector.py`.
+
+### Risk & guardrails (v1)
+
+- **In-process trailing stops are the ONLY protection** — this account can't place exchange-held
+  stop orders, so **a downed bot leaves positions unprotected.** Keep it running during market hours.
+- **Daily-loss circuit breaker** — halts new trades past ~2% of equity/day (floor $2,000), resets
+  00:00 UTC.
+- **Flat position sizing** — magnitude is uncalibrated, so size is flat (`NONMAG_SIZE_FRAC ×
+  MAX_POSITION_USD`), not magnitude-scaled.
+- **Max open positions** cap (45); per-ticker cooldown.
 
 ---
 
-## Risk & guardrails
+## v2 (`v2/`) — how it's different
 
-- **In-process trailing stops are the ONLY protection** — this account can't place exchange-held stop orders, so **a downed bot leaves positions unprotected.** Keep it running during market hours.
-- **Daily-loss circuit breaker** — halts new trades past ~2% of equity/day (resets 00:00 UTC).
-- **Flat position sizing** — magnitude is uncalibrated, so size is flat (`NONMAG_SIZE_FRAC × MAX_POSITION_USD`), not magnitude-scaled.
-- **Max open positions** cap; per-ticker cooldown.
+Lean rewrite for an eventual small real-money account: no confirm/veto gate, no pairs, only
+`lotto` currently enabled, equity-relative sizing instead of a fixed dollar constant, and a
+contract-mispricing switch that can redirect the target contract to a cheaper same-expiry neighbor.
+Runs on its own paper account, in a Docker container. Full detail in [`v2/README.md`](v2/README.md).
 
 ---
 
 ## Project structure
 
 ```
-core/        runtime + engine — bot.py, config.py, dashboard.py, backtest.py,
-             pricing.py, yahoo_data.py, router_eval.py, spawn_daemon.py
-research/    ~110 backtest / analysis / tuning scripts (not needed to run the bot)
-tests/       pytest suite (filters + trading math)
-docs/        HANDOFF.md (full live-state writeup), BOT_FLOW.md
-data/        caches, CSVs, bot_state.json        ← gitignored, machine-local
-logs/        *.log                               ← gitignored
-config.py    → core/config.py is the single source of truth for every tunable
+core/        v1 runtime + engine — bot.py, config.py, dashboard.py, backtest.py, grid_collector.py,
+             pricing.py, yahoo_data.py, router_eval.py, spawn_daemon.py, sec_edgar.py
+v2/          v2 runtime + engine — bot.py, config.py, dashboard.py, execution.py, market.py,
+             scoring.py, filters.py, pricing.py, sec_edgar.py, Dockerfile, docker-compose.yml
+research/    ~180 backtest / analysis / tuning scripts (not needed to run either bot)
+tests/       v1 pytest suite (filters + trading math + grid collector)
+docs/        HANDOFF.md (full live-state writeup)
+data/        v1 caches, CSVs, bot_state.json        ← gitignored, machine-local
+v2/data/     v2 caches, CSVs, bot_state.json        ← gitignored, machine-local
+logs/        v1 *.log                               ← gitignored
+v2/logs/     v2 *.log                                ← gitignored
+everything.sh  single entry point: ollama + v1 (native) + v2 (docker) + v2 dashboard (native)
+manage.sh      v1-only daemon control (start/stop/status/restart-bot/test/backup/watchdog)
 ```
 
 Code is imported via a `_trader_paths.pth` in the venv (`core/`+`research/` on `sys.path`), and
-daemons run with **CWD=`data/`** so data files resolve there. `config.DATA_DIR` / `LOG_DIR` are the
-explicit path anchors.
+v1 daemons run with **CWD=`data/`** so data files resolve there. `config.DATA_DIR` / `LOG_DIR` are
+the explicit path anchors. v2 is fully self-contained under `v2/` with its own `.env`, `data/`,
+`logs/`, and `pytest.ini`.
 
 ---
 
@@ -102,71 +144,93 @@ explicit path anchors.
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -r requirements-dev.txt    # pytest (dev only)
 
-# 2. Local model
-ollama serve &        # then: ollama pull llama3.2   (the primary scorer; runs locally)
+# 2. Local model (used by both v1's primary scorer and v2's ticker corrector)
+ollama serve &        # then: ollama pull llama3.2
 
 # 3. Credentials → .env  (never committed)
-#    ALPACA_API_KEY / ALPACA_SECRET_KEY      paper trading + news + bars
-#    MISTRAL_API_KEY / MISTRAL_BASE_URL      confirm/veto gate
-#    LAB_HOSTED_* (Groq)                     A/B shadow scorer + research backtests
+#    ALPACA_API_KEY / ALPACA_SECRET_KEY      paper trading + news + bars (v1 account)
+#    MISTRAL_API_KEY / MISTRAL_BASE_URL      v1 confirm/veto gate
+#    LAB_HOSTED_* (Groq)                     v1 A/B shadow scorer + research backtests
+#
+# v2 has its own separate .env under v2/ — see v2/README.md (different Alpaca paper account,
+# MOONSHOT_API_KEY for the kimi-k2.6 scorer).
 ```
 
-8GB-RAM note: only `llama3.2` (2GB) fits alongside the bot — larger local models swap and can panic
-the machine. The confirm/veto gate is therefore cloud-based by necessity (see HANDOFF).
+8GB-RAM note: only `llama3.2` (2GB) fits alongside the bots — larger local models swap and can
+panic the machine. v1's confirm/veto gate is therefore cloud-based (Mistral) by necessity; v2's
+primary scorer is cloud-based (kimi-k2.6) for the same reason.
 
 ---
 
 ## Running
 
-Use `manage.sh` (wraps the now-verbose absolute-path daemon launches):
+Use `./everything.sh {start|stop|restart|status}` to bring up/down the **whole stack**: Colima
+(Docker backend) → Ollama → v1 (bot+dashboard, native) → v2 bot (Docker) → v2 dashboard (native).
 
 ```bash
-./manage.sh start        # start bot + dashboard (daemonized, ppid 1, survive the shell)
-./manage.sh sched        # start the backtest scheduler (optional, research)
-./manage.sh status       # show which daemons are up
-./manage.sh restart-bot  # restart just the bot (e.g. after a config change)
-./manage.sh stop         # stop everything
-./manage.sh test         # run the pytest suite
+./everything.sh start
+./everything.sh status
+./everything.sh stop
 ```
 
-- Dashboard: `http://localhost:5001` (status, P&L, open positions w/ side, recent trades w/ close reason, activity feed).
-- pids in `data/*.pid`, logs in `logs/`. Process match: `pgrep -f 'core/bot.py'`.
+For v1-only control (e.g. restarting just the bot after a config change), use `manage.sh` directly:
+
+```bash
+./manage.sh start        # start v1 bot + dashboard (daemonized, ppid 1, survive the shell)
+./manage.sh sched        # start the backtest scheduler (optional, research)
+./manage.sh status       # show which v1 daemons are up
+./manage.sh restart-bot  # restart just the v1 bot
+./manage.sh stop         # stop v1 only
+./manage.sh test         # run the v1 pytest suite
+./manage.sh watchdog     # idempotent auto-restart + caffeinate + log rotation (cron target)
+./manage.sh backup       # code bundle + data/eod_reports → iCloud Drive
+```
+
+For v2-only control, use `docker compose` directly from `v2/` — see [`v2/README.md`](v2/README.md).
+
+- v1 dashboard: `http://localhost:5001` (status, P&L, open positions w/ side, recent trades w/
+  close reason, activity feed).
+- v2 dashboard: runs natively on the host (not containerized) — see `v2/README.md` for port/run
+  command.
+- pids in `data/*.pid` (v1) / `v2/data/*.pid` (v2), logs in `logs/` / `v2/logs/`. Process match:
+  `pgrep -f 'core/bot.py'`.
 - Log timestamps are **local PDT**, not UTC.
 
 ---
 
 ## Configuration
 
-Everything tunable lives in **`core/config.py`** (imported by both the live bot and the backtests).
-Key knobs: the pre-score pattern lists (`PRESCORE_SKIP_PATTERNS`, `SOFT_CATALYST_PATTERNS`), the
-regime filter (`REGIME_MA_DAYS`, `REGIME_MOMENTUM_DAYS`, `REGIME_BYPASS_MIN_MAGNITUDE`), the gate
-(`GEMINI_MODEL`, `GEMINI_CONFIRM_MIN_MAGNITUDE`), and sizing/risk limits. Most accept `.env`
-overrides — see the comments in `config.py`.
+Everything tunable for v1 lives in **`core/config.py`**; for v2, in **`v2/config.py`**. Each bot
+has its own config, its own `.env`, and its own tuned parameters — they do not share state or
+config beyond both reading from the same `research/` scripts when doing analysis.
 
 ---
 
 ## Testing
 
-`pytest` (config in `pytest.ini`) covers the pure-logic core — the pre-score filters and the trading
-math (realized P&L incl. short-side sign, flat sizing, hold caps). Run before any change:
-
 ```bash
-./manage.sh test
+./manage.sh test              # v1 suite (pytest.ini at repo root)
+cd v2 && pytest                # v2 suite (self-contained pytest.ini)
 ```
+
+Both suites cover pure-logic code — pre-score filters, trading math (realized P&L incl. short-side
+sign, flat/equity-relative sizing, hold caps), and (v1 only) the grid collector. Run before any
+change.
 
 ---
 
 ## Backtesting & research
 
-The `research/` scripts replay history with Black-Scholes + IV-crush option pricing and bootstrap
-P&L confidence intervals. They're how every filter and the gate were validated (e.g.
-`index_event_backtest.py`, `regime_bypass_option_pnl.py`, `overnight_confirm_veto.py`). They import
-the live `core/` modules, so they test exactly what trades.
+The `research/` scripts replay history with Black-Scholes + IV-crush option pricing, real Alpaca
+historical option trades/bars where available, and bootstrap P&L confidence intervals. They're how
+every filter and both gates were validated. They import the live `core/`/`v2/` modules where
+possible, so they test close to what actually trades.
 
 ---
 
 ## Safety
 
-Paper trading only — built for research and education. Do not point this at real money. The bot will
-not trade outside market hours; the in-process trailing stop is the sole position protection (no
-exchange-held stops on this account).
+Paper trading only — built for research and education. Do not point either bot at real money. v1's
+in-process trailing stop is the sole position protection for that account (no exchange-held stops
+available); a downed v1 bot leaves positions unprotected. v2's risk model is documented in
+`v2/README.md`.
