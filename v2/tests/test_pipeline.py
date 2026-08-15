@@ -1,6 +1,7 @@
 """Tests for the v2-specific pipeline changes: regime-gate-first ordering, the ticker-selection
 corrector, and equity-relative sizing (the structural fixes from the small-account rework)."""
 import asyncio
+import json
 
 import pytest
 
@@ -284,6 +285,32 @@ def test_lotto_stop_is_peak_anchored_reversing_the_old_entry_only_rule():
     assert not mkt._lotto_stop_loss_hit(spiked, 0.84) or mkt.lotto_stop_price(spiked) > \
         mkt.lotto_stop_price(flat)
     assert mkt.lotto_stop_price(spiked) > mkt.lotto_stop_price(flat)
+
+
+def test_write_bot_state_lotto_stop_tracks_the_peak(tmp_path, monkeypatch):
+    """Regression for a real 2026-08-03 bug: _write_bot_state() had its own leftover
+    entry-anchored formula for lotto (`entry * (1 - LOTTO_STOP_LOSS_PCT)`) that predated the
+    trailing-stop redesign and was never updated, so bot_state.json -- and therefore the
+    dashboard's stop_price column -- never moved off the entry floor even though the real
+    in-process monitor was correctly trailing the peak via lotto_stop_price(). Caught via a real
+    open BA position whose bot_state.json showed stop_price=0.496 (== entry floor) while
+    peak_price=1.14 implied a trailing stop near 0.969."""
+    state_file = tmp_path / "bot_state.json"
+    monkeypatch.setattr(mkt, "BOT_STATE_FILE", str(state_file))
+    mkt._monitored_positions.clear()
+    mkt._monitored_positions["BA260814C00250000"] = {
+        "qty": 1, "entry_price": 0.62, "peak_price": 1.14, "underlying": "BA",
+        "asset_type": "option", "strategy": "lotto", "entry_dt": None,
+    }
+    try:
+        mkt._write_bot_state()
+        written = json.loads(state_file.read_text())
+    finally:
+        mkt._monitored_positions.clear()
+    assert written["BA260814C00250000"]["stop_price"] == pytest.approx(
+        mkt.lotto_stop_price({"entry_price": 0.62, "peak_price": 1.14}))
+    # the bug's exact symptom: stop_price must NOT equal the stale entry-anchored floor
+    assert written["BA260814C00250000"]["stop_price"] != pytest.approx(0.62 * 0.80)
 
 
 def test_lotto_same_day_exit_requires_same_calendar_date(monkeypatch):

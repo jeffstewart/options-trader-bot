@@ -244,7 +244,7 @@ def _write_bot_state():
         strategy = pos.get("strategy", "news_call")
         entry = pos["entry_price"]
         if strategy == "lotto":
-            stop_price = entry * (1 - cfg.LOTTO_STOP_LOSS_PCT)
+            stop_price = lotto_stop_price(pos)
         else:
             gain  = (pos["peak_price"] / entry - 1.0) if entry else 0.0
             trail = long_trail_for(strategy, asset_type, gain)

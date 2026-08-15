@@ -24,13 +24,15 @@ import time
 from datetime import datetime, timezone
 
 import anthropic
+import openai
 from openai import OpenAI
 
 import config as cfg
 
 log = logging.getLogger(__name__)
 
-# Ollama client is now ONLY for correct_ticker() -- the primary scorer is Anthropic.
+# Ollama client is now ONLY for correct_ticker() -- the primary scorer is Anthropic (or Kimi, see
+# below).
 ollama_client = OpenAI(base_url=cfg.OLLAMA_BASE_URL, api_key="ollama")
 
 # max_retries covers the container's real failure mode: DNS resolution inside Docker drops in
@@ -45,6 +47,21 @@ anthropic_client = anthropic.Anthropic(
     timeout=cfg.SCORER_TIMEOUT_S,
     max_retries=cfg.SCORER_MAX_RETRIES,
 )
+
+# Kimi (Moonshot) -- OpenAI-compatible endpoint, same client shape research/kimi_scorer.py uses.
+# Constructed unconditionally (cheap, no network call) so importing this module never fails; a
+# missing key is caught by preflight() before any article is scored.
+kimi_client = OpenAI(
+    base_url=cfg.MOONSHOT_BASE_URL,
+    api_key=cfg.MOONSHOT_API_KEY or "unset",
+    timeout=cfg.SCORER_TIMEOUT_S,
+    max_retries=cfg.SCORER_MAX_RETRIES,
+)
+
+
+def _is_kimi() -> bool:
+    return cfg.SCORER_MODEL.startswith("kimi")
+
 
 SCORER_LATENCY_CSV = "scorer_latency.csv"
 
@@ -128,7 +145,10 @@ _SCORE_SCHEMA = {
 def _log_latency(ms: float, usage, ok: bool, model: str) -> None:
     """Per-call latency + token usage, to the log line's caller AND a CSV for analysis.
     Latency is the number that decides whether the adaptive-thinking default stays: this is a
-    hot path (news edge decays in minutes) and it replaced a ~1-11s local call."""
+    hot path (news edge decays in minutes) and it replaced a ~1-11s local call.
+    `usage` is a normalized (input_tokens, output_tokens, cache_read_input_tokens) namedtuple-like
+    object -- callers translate the Anthropic/OpenAI SDK's own usage shape into that before
+    passing it in, so this function stays provider-agnostic."""
     try:
         new = not os.path.exists(SCORER_LATENCY_CSV)
         with open(SCORER_LATENCY_CSV, "a", newline="") as f:
@@ -144,13 +164,43 @@ def _log_latency(ms: float, usage, ok: bool, model: str) -> None:
         log.debug("latency log failed: %s", e)
 
 
+class _Usage:
+    """Normalizes Anthropic's (input_tokens/output_tokens/cache_read_input_tokens) and OpenAI's
+    (prompt_tokens/completion_tokens, no cache field) usage shapes to one interface so
+    _log_latency and the log line don't need to know which provider answered."""
+    def __init__(self, input_tokens=None, output_tokens=None, cache_read_input_tokens=None):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
+
+
 def preflight() -> bool:
     """Startup reachability + auth + model-access check for the scorer, run once before any news
     is processed. Exists because of how the container fails: DNS drops in bursts and the old
     Ollama scorer failed *silently* per-article (log.warning at most). Without this, a missing
-    ANTHROPIC_API_KEY or a blocked egress path presents as "the bot is running but never trades" --
-    the exact ambiguity that hid v2's zero-trade problem for a week. models.retrieve is free (no
-    tokens) and validates DNS, TLS, credentials, and model entitlement in one call."""
+    API key or a blocked egress path presents as "the bot is running but never trades" -- the
+    exact ambiguity that hid v2's zero-trade problem for a week."""
+    if _is_kimi():
+        if not cfg.MOONSHOT_API_KEY:
+            log.error("❌ MOONSHOT_API_KEY is not set — the scorer cannot run. Add it to v2/.env "
+                      "(docker-compose injects that file via env_file) and restart.")
+            return False
+        try:
+            t0 = time.monotonic()
+            ids = [m.id for m in kimi_client.models.list().data]
+            if cfg.SCORER_MODEL not in ids:
+                log.error("❌ scorer model %r not returned by Moonshot's /v1/models for this "
+                          "key (got: %s)", cfg.SCORER_MODEL, ", ".join(ids[:8]))
+                return False
+            log.info("✅ scorer reachable: %s (Moonshot/Kimi) in %.0fms", cfg.SCORER_MODEL,
+                      (time.monotonic() - t0) * 1000)
+            return True
+        except Exception as e:
+            log.error("❌ scorer preflight failed (%s): %s", type(e).__name__, e)
+            return False
+
+    # models.retrieve is free (no tokens) and validates DNS, TLS, credentials, and model
+    # entitlement in one call.
     if not cfg.ANTHROPIC_API_KEY and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
         log.error("❌ ANTHROPIC_API_KEY is not set — the scorer cannot run. Add it to v2/.env "
                   "(docker-compose injects that file via env_file) and restart.")
@@ -174,44 +224,82 @@ def preflight() -> bool:
     return False
 
 
-def score_article(headline: str, body: str, source: str = "") -> "dict | None":
-    prefix = f"[Source: {source}]\n" if source else ""
+def _score_article_kimi(headline: str, body: str, prefix: str) -> "tuple[dict | None, _Usage]":
+    """kimi-k2.6 is a reasoning model that burns ~1,650 tokens/article and can truncate before
+    the JSON answer if thinking is left on (research/kimi_scorer.py, measured 2026-07-30) -- so
+    thinking is disabled unless SCORER_THINKING is explicitly "enabled". No temperature parameter:
+    kimi-k2.6 rejects anything but 1 (`400 invalid temperature`). No structured-output schema --
+    that's an Anthropic-only feature; parse the text the same way anthropic_scorer.py's Ollama
+    path always has."""
+    resp = kimi_client.chat.completions.create(
+        model=cfg.SCORER_MODEL,
+        max_tokens=cfg.SCORER_MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content":
+             f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}\n\n"
+             f"Respond with JSON only."},
+        ],
+        **({} if cfg.SCORER_THINKING == "enabled"
+           else {"extra_body": {"thinking": {"type": "disabled"}}}),
+    )
+    u = getattr(resp, "usage", None)
+    usage = _Usage(getattr(u, "prompt_tokens", None), getattr(u, "completion_tokens", None))
+    raw = (resp.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        return json.loads(raw.strip()), usage
+    except json.JSONDecodeError:
+        log.warning("scorer returned unparseable text: %r", raw[:200])
+        return None, usage
+
+
+def _score_article_anthropic(headline: str, body: str, prefix: str) -> "tuple[dict | None, _Usage]":
     thinking = ({"type": "disabled"} if cfg.SCORER_THINKING == "disabled"
                 else {"type": "adaptive"})
+    resp = anthropic_client.messages.create(
+        model=cfg.SCORER_MODEL,
+        max_tokens=cfg.SCORER_MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        thinking=thinking,
+        output_config={"effort": cfg.SCORER_EFFORT,
+                       "format": {"type": "json_schema", "schema": _SCORE_SCHEMA}},
+        messages=[{"role": "user", "content":
+                   f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}"}],
+    )
+    u = resp.usage
+    usage = _Usage(getattr(u, "input_tokens", None), getattr(u, "output_tokens", None),
+                   getattr(u, "cache_read_input_tokens", None))
+    # Safety classifiers can decline a request (HTTP 200 + stop_reason "refusal"), and max_tokens
+    # can truncate -- either way `content` may be empty or partial, so never index into it blindly.
+    if resp.stop_reason == "refusal":
+        log.warning("scorer refused (%s) — treating as unscorable",
+                    getattr(resp.stop_details, "category", None))
+        return None, usage
+    text = next((b.text for b in resp.content if b.type == "text"), None)
+    if not text:
+        log.warning("scorer returned no text (stop_reason=%s)", resp.stop_reason)
+        return None, usage
+    return json.loads(text), usage
+
+
+def score_article(headline: str, body: str, source: str = "") -> "dict | None":
+    prefix = f"[Source: {source}]\n" if source else ""
     t0 = time.monotonic()
     usage, ok = None, False
     try:
-        resp = anthropic_client.messages.create(
-            model=cfg.SCORER_MODEL,
-            max_tokens=cfg.SCORER_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            thinking=thinking,
-            output_config={"effort": cfg.SCORER_EFFORT,
-                           "format": {"type": "json_schema", "schema": _SCORE_SCHEMA}},
-            messages=[{"role": "user", "content":
-                       f"{prefix}Headline: {headline}\n\nBody: {body[:SCORE_BODY_CHARS]}"}],
-        )
-        usage = resp.usage
-        # Safety classifiers can decline a request (HTTP 200 + stop_reason "refusal"), and
-        # max_tokens can truncate -- either way `content` may be empty or partial, so never index
-        # into it blindly.
-        if resp.stop_reason == "refusal":
-            log.warning("scorer refused (%s) — treating as unscorable",
-                        getattr(resp.stop_details, "category", None))
-            return None
-        text = next((b.text for b in resp.content if b.type == "text"), None)
-        if not text:
-            log.warning("scorer returned no text (stop_reason=%s)", resp.stop_reason)
-            return None
-        signal = json.loads(text)
-        ok = True
+        signal, usage = (_score_article_kimi(headline, body, prefix) if _is_kimi()
+                         else _score_article_anthropic(headline, body, prefix))
+        ok = signal is not None
         return signal
-    except anthropic.APIStatusError as e:
-        log.warning("scorer API error %s: %s", e.status_code, e.message)
-        return None
-    except anthropic.APIConnectionError as e:
-        # Already retried SCORER_MAX_RETRIES times by the SDK -- a burst outlasted the backoff.
-        log.warning("scorer unreachable after retries: %s", e)
+    except (anthropic.APIStatusError, anthropic.APIConnectionError,
+            openai.APIStatusError, openai.APIConnectionError) as e:
+        # *.APIConnectionError: already retried SCORER_MAX_RETRIES times by the SDK -- a burst
+        # outlasted the backoff.
+        log.warning("scorer API error: %s", e)
         return None
     except Exception as e:
         log.warning("scoring failed: %s", e)

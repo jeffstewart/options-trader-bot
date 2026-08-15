@@ -56,18 +56,32 @@ DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # row), i.e. the confidence gate carried zero information. sonnet5 on the same lotto geometry:
 # win 39.5% vs llama's best comparable cell at 30.7% (research/lotto_sonnet5_selectivity_grid.py).
 # The point of the swap is a working dial, not a better average.
-SCORER_MODEL   = os.environ.get("SCORER_MODEL", "claude-sonnet-5")
-SCORER_EFFORT  = os.environ.get("SCORER_EFFORT", "low")   # low|medium|high|xhigh|max
+#
+# TEMPORARY 2026-08-04: defaulted to kimi-k2.6 because jeff is out of Anthropic API credits.
+# Revert by unsetting SCORER_MODEL (or setting it back to claude-sonnet-5) once credits are back --
+# no other code change needed, scoring.py branches on the "kimi" prefix. Same anthropic_scorer
+# prompt either way; matched-trade-count testing (project_kimi_scorer memory) found no P&L
+# separation between sonnet5 and kimi-k2.6 on this prompt, so the live mag/conf thresholds below
+# don't need retuning for the swap.
+SCORER_MODEL   = os.environ.get("SCORER_MODEL", "kimi-k2.6")
+SCORER_EFFORT  = os.environ.get("SCORER_EFFORT", "low")   # low|medium|high|xhigh|max — Anthropic only
 # Sonnet 5 runs adaptive thinking by DEFAULT (unlike Sonnet 4.6, where omitting the field meant no
 # thinking). For this workload -- a bounded classification against a fixed schema, on a hot path
 # where news edge decays in minutes -- adaptive+low is the documented starting point, but thinking
 # means variable latency. Flip to "disabled" for the tightest, most predictable latency once the
 # logged numbers below tell us what we're actually paying. One-line change either way.
-SCORER_THINKING = os.environ.get("SCORER_THINKING", "adaptive")   # adaptive|disabled
+# For kimi, this is repurposed as an on/off switch (see scoring.py): anything other than "enabled"
+# disables kimi's reasoning mode, which is the only combination ever tested live -- leaving it on
+# burns ~1,650 reasoning tokens/article and risks truncating before the JSON answer
+# (research/kimi_scorer.py, measured 2026-07-30).
+SCORER_THINKING = os.environ.get("SCORER_THINKING", "adaptive")   # adaptive|disabled|enabled
 SCORER_MAX_TOKENS = 1024        # schema-bounded output; nowhere near needing streaming
 SCORER_TIMEOUT_S  = float(os.environ.get("SCORER_TIMEOUT_S", "20"))
 SCORER_MAX_RETRIES = int(os.environ.get("SCORER_MAX_RETRIES", "4"))  # see DNS note in scoring.py
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Moonshot (Kimi) -- OpenAI-compatible endpoint, same account/key as research/kimi_scorer.py.
+MOONSHOT_API_KEY  = os.environ.get("MOONSHOT_API_KEY", "")
+MOONSHOT_BASE_URL = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
 
 # Ollama is still used for the TICKER CORRECTOR only (below) -- deliberately left local/free.
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
