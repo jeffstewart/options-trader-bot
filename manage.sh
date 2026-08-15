@@ -8,14 +8,27 @@ ROOT=/Users/jeff/Claude/Trader
 PY=$ROOT/.venv/bin/python
 spawn() { $PY $ROOT/core/spawn_daemon.py "$1" "$2" "${@:3}"; }   # PIDFILE LOGFILE CMD...
 
-start_bot()   { spawn $ROOT/data/bot.pid                $ROOT/logs/bot.log                $PY -u $ROOT/core/bot.py; }
-start_dash()  { spawn $ROOT/data/dashboard.pid          $ROOT/logs/dashboard.log          $PY -u $ROOT/core/dashboard.py; }
-start_sched() { spawn $ROOT/data/resume_after_reset.pid $ROOT/logs/resume_after_reset.log $PY -u $ROOT/research/resume_after_reset.py; }
-
 WDLOG=$ROOT/logs/watchdog.log
 wlog() { echo "[$(date '+%F %T')] $1" >> $WDLOG; }
 
 is_up() { local p=$(cat $ROOT/data/$1.pid 2>/dev/null); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+
+# Idempotency guard (2026-08-08): `start` used to spawn unconditionally, so two `start` calls
+# close together (e.g. the user running it manually, then everything.sh running it again) each
+# spawned a FULLY WORKING second bot process -- bot.py binds no port, so nothing errors, and both
+# instances run concurrently with their own independent in-memory cooldown/position-cap state,
+# unaware of each other. The pidfile only tracks whichever one spawned last, so the first becomes
+# an untracked orphan that `stop` can't find. Caught via a real incident: two live bot.py
+# processes (09:25 and 09:29 startup banners in logs/bot.log) after two `start` calls a few
+# minutes apart.
+guarded_start() {
+  local name=$1 pidfile=$2 logfile=$3; shift 3
+  if is_up "$name"; then echo "  $name: already up (pid $(cat $ROOT/data/$name.pid)) — not spawning a second one"; return; fi
+  spawn "$pidfile" "$logfile" "$@"
+}
+start_bot()   { guarded_start bot                $ROOT/data/bot.pid                $ROOT/logs/bot.log                $PY -u $ROOT/core/bot.py; }
+start_dash()  { guarded_start dashboard          $ROOT/data/dashboard.pid          $ROOT/logs/dashboard.log          $PY -u $ROOT/core/dashboard.py; }
+start_sched() { guarded_start resume_after_reset $ROOT/data/resume_after_reset.pid $ROOT/logs/resume_after_reset.log $PY -u $ROOT/research/resume_after_reset.py; }
 
 # Restart a daemon if its pidfile process is gone. $1=pidfile-name $2=start-fn
 ensure() { if ! is_up "$1"; then wlog "$1 DOWN → restarting"; $2 || wlog "$1 restart FAILED"; fi; }
@@ -50,9 +63,11 @@ case "$1" in
     echo "stopped all daemons" ;;
   restart-bot) pkill -f 'core/bot.py' 2>/dev/null || true; sleep 2; start_bot; echo "bot restarted" ;;
   status)
+    # Uses is_up (not a raw `cat pidfile`) specifically so a MISSING pidfile reports "down"
+    # instead of aborting the whole loop under `set -e` -- a raw unguarded `p=$(cat missing-file)`
+    # exits nonzero and killed this loop after just the first line, mid-incident 2026-08-08.
     for n in bot dashboard resume_after_reset groq_backtest; do
-      p=$(cat $ROOT/data/$n.pid 2>/dev/null)
-      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then echo "  $n: UP (pid $p)"; else echo "  $n: down"; fi
+      is_up "$n" && echo "  $n: UP (pid $(cat $ROOT/data/$n.pid))" || echo "  $n: down"
     done ;;
   restart-dash) pkill -f 'core/dashboard.py' 2>/dev/null || true; sleep 2; start_dash; echo "dashboard restarted" ;;
   backup)
