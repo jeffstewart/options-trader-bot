@@ -84,13 +84,43 @@ percentile) rather than only what clears today's trade threshold. For every qual
 fetches a wide DTE(3-30)×strike(0.85x-1.25x) grid of real contracts, snapshots bid/ask/greeks/OI,
 and re-polls that same grid on a decaying schedule (30s → 3min → 15min → 30min, market-hours-gated
 only) through each contract's own expiry (capped at `GRID_MAX_TRACK_DAYS=32`). Output:
-`data/contract_grid_snapshots.csv` (24 columns incl. signal id/headline/mag/conf, per-snapshot
-bid/ask/mid/spread/IV/greeks).
+`data/contract_grid_snapshots.csv` (36 columns).
 
 **Why:** to answer "which contract would have performed best, and how far past today's exit point
 did contracts keep moving" independent of what the live contract-picker actually chose — the
 picker's own proximity-first sort + 5-candidate shortlist means a lot of real information about
-untested candidates is currently invisible to backtesting.
+untested candidates is currently invisible to backtesting. Jeff's plan is a later 80/20 train/test
+split over this dataset to fit a contract-selection model against every factor available at
+signal time, so the schema was reviewed (2026-08-15) against that goal and widened beyond just
+market-data:
+
+- **Signal-level** (repeated on every row for a signal_id): `signal_id`, `signal_ts`, `ticker`,
+  `headline`, `source` (Benzinga/SEC EDGAR/NewsAPI), `scorer_model` (so results can be
+  recalibrated across future model swaps), `magnitude`, `confidence`, `catalyst` (the LLM's third
+  score), `stock_price_at_signal`, `passes_news_call_gate` / `passes_lotto_gate` (pure-logic
+  threshold-eligibility flags, duplicated from bot.py's formulas rather than replaying the real
+  gate — see below).
+- **Market state at signal time**: `spy_price`, `spy_sma`, `regime_uptrend`, `regime_mom_ok`,
+  `regime_chop_ok`, `regime_dd_density` (same 200d-SMA/3d-momentum/chop-brake regime the live gate
+  uses, cached once/day) and a VIX proxy — see below.
+- **Per-snapshot**: `snapshot_ts`, `minutes_since_signal`, `stock_price` (re-fetched every poll,
+  not just at signal time — tracks moneyness drift over the life of the hold), `symbol`, `strike`,
+  `expiry`, `dte_at_signal`, `oi_at_signal`, `bid`, `ask`, `mid`, `spread_pct`, `iv`, `delta`,
+  `gamma`, `theta`, `vega`, `rho`.
+
+Day-of-week / time-of-day were considered but not added as separate columns — both timestamp
+columns are full datetimes, so they're trivially derivable during analysis.
+
+**VIX proxy (`vol_proxy_*` columns):** true CBOE VIX is not reachable on this Alpaca plan —
+confirmed live 2026-08-15: `/v1beta1/indices/*` 404s, and a bare `"VIX"` stock-symbol lookup
+returns no trade data. `VIXY` (ProShares VIX Short-Term Futures ETF, a normal tradable equity) is
+used as the closest available proxy. Logged as `vol_proxy_pctile` — the latest close's
+**percentile rank within its own trailing `GRID_VOL_PROXY_LOOKBACK_DAYS` (20) window** — rather
+than a raw price or an SMA comparison, because VIXY bleeds value over time from contango roll cost
+and gets reverse-split periodically, so its own long-run price trend is structural decay, not a
+volatility signal; a long-window SMA would misread that decay as "always calm." The percentile
+cancels the drift out and answers the question that matters: is volatility elevated relative to
+its own recent past, right now. Config: `GRID_VOL_PROXY_SYMBOL`, `GRID_VOL_PROXY_LOOKBACK_DAYS`.
 
 **Design decisions worth remembering:**
 - Deliberately lives in **v1, not v2** — v1 parses every article regardless of trade eligibility,
@@ -103,9 +133,16 @@ untested candidates is currently invisible to backtesting.
 - No new paper account / no capital needed — this replaced an earlier proposal to actually trade a
   wide grid of contracts in a funded account; the batched Alpaca snapshot endpoint (`get_option_snapshot`)
   does the same job for free.
+- `passes_news_call_gate`/`passes_lotto_gate` are a coarse eligibility label only — they do NOT
+  account for the confirm/veto gate, cooldown, liquidity, or position caps. Replaying the real gate
+  for every logged signal would cost a real paid API call each time, defeating the point of a
+  free/broad collector. There is also no join key back to `trades.csv` yet for signals that did
+  become real trades — a real gap, deferred (would mean threading a `signal_id` into the shared
+  order-placement path, touched by more than just this module).
 - **Known Alpaca limitation this collector cannot work around**: there is no historical *bid/ask
   quote* endpoint, only a live one — so this collector is only useful going forward from
-  2026-08-XX; it cannot backfill true historical spreads for past signals.
+  2026-08-XX; it cannot backfill true historical spreads for past signals. Same plan gap rules out
+  historical VIX, incidentally — the indices endpoint 404s regardless of date.
 
 Still accumulating data as of this writing — not yet used to inform a real contract-picker or
 exit-logic change. Revisit once there's enough signal-days to look at.

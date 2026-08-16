@@ -91,6 +91,21 @@ data to evaluate the contract-picking logic (which of the available strikes/expi
 performed best) and the exit logic (how far past today's sell point contracts kept moving),
 independent of what the bot actually happened to trade. See `core/grid_collector.py`.
 
+Each row also carries the context needed for a later train/test analysis of what makes a good
+contract pick: which scorer model produced the score (`scorer_model`, so results can be
+recalibrated across model swaps), the LLM's `catalyst` sub-score, the underlying stock price at
+signal time and at every poll, the day's SPY trend/momentum/chop-brake regime state, a VIX proxy
+(see below), the news source, and whether the signal cleared each strategy's live threshold
+(`passes_news_call_gate` / `passes_lotto_gate`). Timestamps are full datetimes, so day-of-week /
+time-of-day are derivable without extra columns.
+
+**VIX proxy**: true CBOE VIX isn't reachable on this Alpaca plan (no indices data endpoint).
+`VIXY` (a normal equity, VIX-futures-based) is used as the closest available proxy, logged as its
+**percentile rank within its own trailing 20-session window** (`vol_proxy_pctile`) rather than a
+raw price or an SMA comparison — VIXY bleeds value over time from contango roll cost and periodic
+reverse splits, so its long-run price trend is structural decay, not a volatility signal; the
+percentile cancels that drift out.
+
 ### Risk & guardrails (v1)
 
 - **In-process trailing stops are the ONLY protection** — this account can't place exchange-held
