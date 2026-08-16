@@ -302,11 +302,26 @@ def _snapshot_rows(signal_id: str, state: dict) -> list[list]:
     return rows
 
 
-async def start_collection(ticker: str, signal: dict, headline: str, source: str,
+def make_signal_id(ticker: str, signal_ts: datetime) -> str:
+    """Pure, deterministic given (ticker, signal_ts) -- exposed so bot.py can mint the SAME id
+    before scheduling the collector task and stash it on the signal dict, letting trades.csv /
+    closed_trades.csv carry a grid_signal_id column that joins back to this module's CSV. Must
+    stay a pure function of its inputs (no clock read inside) so the id bot.py mints and passes
+    in is byte-identical to what would be derived from it, not a second, slightly-later timestamp."""
+    return f"{ticker}_{signal_ts.strftime('%Y%m%dT%H%M%S%f')}"
+
+
+async def start_collection(signal_id: str, signal_ts: datetime, ticker: str, signal: dict,
+                            headline: str, source: str,
                             get_stock_price: Callable[[str], Optional[float]]) -> None:
     """Fire-and-forget entry point -- called from process_signal as asyncio.create_task(...).
     Never raises: any failure here must not affect real trading. `get_stock_price` is injected by
-    the caller (bot.py's own function) to avoid a circular import between this module and bot.py."""
+    the caller (bot.py's own function) to avoid a circular import between this module and bot.py.
+    `signal_id`/`signal_ts` are minted by the CALLER (via make_signal_id, at the moment it decides
+    to collect) rather than here, so the same id can be stashed on signal["_grid_signal_id"] and
+    end up in trades.csv/closed_trades.csv for a real join -- generating it here, after an awaited
+    stock-price fetch, would make it a few hundred ms later than what bot.py could see at
+    scheduling time."""
     try:
         loop = asyncio.get_event_loop()
         stock_price = await loop.run_in_executor(None, get_stock_price, ticker)
@@ -317,8 +332,6 @@ async def start_collection(ticker: str, signal: dict, headline: str, source: str
             return
         regime = await loop.run_in_executor(None, _regime_snapshot)
 
-        signal_ts = datetime.now(timezone.utc)
-        signal_id = f"{ticker}_{signal_ts.strftime('%Y%m%dT%H%M%S%f')}"
         last_expiry = max(date.fromisoformat(exp) for _, exp, _, _ in contracts_meta.values())
         magnitude = float(signal.get("magnitude", 0))
         confidence = float(signal.get("confidence", 0))

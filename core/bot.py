@@ -1255,6 +1255,7 @@ def place_option_trade(ticker: str, stock_price: float, signal: dict, position_u
         "stop_order_id": None,            # no exchange stop — monitor protects
         "strategy":      strategy,
         "entry_dt":      datetime.now(timezone.utc),
+        "grid_signal_id": signal.get("_grid_signal_id", ""),
     }
     log.info("🔒 In-process trailing stop registered for %s @ cost $%.4f  (trail %.0f%%)  [%s]",
              contract["symbol"], entry, init_trail * 100, strategy)
@@ -1371,6 +1372,7 @@ def place_stock_trade(ticker: str, stock_price: float, signal: dict,
         "stop_order_id": None,
         "strategy":      strategy,
         "entry_dt":      datetime.now(timezone.utc),
+        "grid_signal_id": signal.get("_grid_signal_id", ""),
     }
     trail0 = long_trail_for(strategy, "stock", 0.0)
     log.info("🔒 Stock trailing stop for %s @ $%.2f  stop=$%.2f (%.0f%% initial)  [%s]",
@@ -1563,6 +1565,7 @@ def place_short_trade(ticker: str, stock_price: float, signal: dict,
         "stop_order_id": None,
         "strategy":      strategy,
         "entry_dt":      datetime.now(timezone.utc),
+        "grid_signal_id": signal.get("_grid_signal_id", ""),
     }
     log.info("🔒 Short stop for %s @ $%.2f  stop=$%.2f (%.0f%% trail)  [%s]",
              ticker, stock_price, initial_stop, strail * 100, strategy)
@@ -1992,6 +1995,10 @@ def load_open_positions_from_alpaca():
                     "stop_order_id": None,
                     "strategy":      strategy,
                     "entry_dt":      entry_dt,
+                    # grid_signal_id: trades.csv is the authoritative source (same reasoning as
+                    # strategy above) -- carries the join key back to contract_grid_snapshots.csv
+                    # across a restart so the eventual close still gets logged with it.
+                    "grid_signal_id": entry_row.get("grid_signal_id") or "",
                 }
                 if info.get("materiality") is not None:   # preserve lotto shadow A/B tag
                     _monitored_positions[symbol]["materiality"] = info.get("materiality")
@@ -3341,8 +3348,14 @@ async def process_signal(headline: str, body: str, source: str,
     if GRID_COLLECTOR_ENABLED and grid_collector.should_collect(signal):
         grid_tickers = [t for t in (signal.get("tickers") or []) if t not in ("BTC", "ETH")]
         if grid_tickers:
+            # Mint the id here (not inside start_collection) and stash it on the signal dict so
+            # a real trade off this same signal can carry it into trades.csv/closed_trades.csv as
+            # grid_signal_id -- the join key back to this signal's contract_grid_snapshots.csv rows.
+            grid_signal_ts = datetime.now(timezone.utc)
+            grid_signal_id = grid_collector.make_signal_id(grid_tickers[0], grid_signal_ts)
+            signal["_grid_signal_id"] = grid_signal_id
             asyncio.create_task(grid_collector.start_collection(
-                grid_tickers[0], signal, headline, source, get_stock_price))
+                grid_signal_id, grid_signal_ts, grid_tickers[0], signal, headline, source, get_stock_price))
 
     passes, magnitude, req_conf = signal_checks(signal)
     if not passes:
@@ -3730,6 +3743,7 @@ def log_trade(ticker, contract, qty, signal, entry_price, strategy="news_call"):
                 "qty", "bid", "ask", "cost_basis", "max_loss",
                 "spread_pct", "trailing_stop_pct",
                 "confidence", "magnitude", "reasoning", "strategy", "scorer", "news_source",
+                "grid_signal_id",
             ])
         w.writerow([
             datetime.now(timezone.utc).isoformat(),
@@ -3741,7 +3755,7 @@ def log_trade(ticker, contract, qty, signal, entry_price, strategy="news_call"):
             f"{TRAILING_STOP_PCT * 100:.0f}%",
             signal.get("confidence"), signal.get("magnitude"),
             signal.get("reasoning", ""), strategy, signal.get("_scorer", "ollama"),
-            signal.get("_source", ""),
+            signal.get("_source", ""), signal.get("_grid_signal_id", ""),
         ])
 
 CLOSED_TRADES_FILE = "closed_trades.csv"
@@ -3759,7 +3773,7 @@ def log_closed_trade(symbol: str, pos: dict, exit_price: float, pnl_usd: float, 
         if write_header:
             w.writerow(["timestamp", "symbol", "underlying", "strategy", "asset_type",
                         "qty", "entry_price", "exit_price", "pnl_usd", "pnl_pct",
-                        "peak_price", "reason"])
+                        "peak_price", "reason", "grid_signal_id"])
         w.writerow([
             datetime.now(timezone.utc).isoformat(),
             symbol,
@@ -3773,6 +3787,7 @@ def log_closed_trade(symbol: str, pos: dict, exit_price: float, pnl_usd: float, 
             f"{pnl_pct:.2f}",
             f"{pos.get('peak_price', entry):.4f}",
             reason,
+            pos.get("grid_signal_id", ""),
         ])
 
 
@@ -3787,6 +3802,7 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
                 "qty", "bid", "ask", "cost_basis", "max_loss",
                 "spread_pct", "trailing_stop_pct",
                 "confidence", "magnitude", "reasoning", "strategy", "scorer", "news_source",
+                "grid_signal_id",
             ])
         w.writerow([
             datetime.now(timezone.utc).isoformat(),
@@ -3798,7 +3814,7 @@ def log_trade_stock(ticker: str, shares: int, entry_price: float, signal: dict, 
             f"{STOCK_TRAIL_PCT * 100:.0f}%",
             signal.get("confidence"), signal.get("magnitude"),
             signal.get("reasoning", ""), strategy, signal.get("_scorer", "ollama"),
-            signal.get("_source", ""),
+            signal.get("_source", ""), signal.get("_grid_signal_id", ""),
         ])
 
 # ═══════════════════════════════════════════════════════════════════════════════

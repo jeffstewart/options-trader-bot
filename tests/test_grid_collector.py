@@ -169,8 +169,16 @@ def test_write_rows_never_raises_on_bad_path(monkeypatch):
     gc._write_rows([["x"] * len(gc._HEADER)])
 
 
+def test_make_signal_id_is_pure_and_deterministic():
+    ts = datetime(2026, 8, 15, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    assert gc.make_signal_id("ABC", ts) == gc.make_signal_id("ABC", ts)
+    assert gc.make_signal_id("ABC", ts) != gc.make_signal_id("XYZ", ts)
+
+
 def test_start_collection_never_raises_when_stock_price_unavailable():
-    asyncio.run(gc.start_collection("ABC", {"magnitude": 0.9, "confidence": 0.9}, "h", "s",
+    ts = datetime.now(timezone.utc)
+    asyncio.run(gc.start_collection(gc.make_signal_id("ABC", ts), ts, "ABC",
+                                     {"magnitude": 0.9, "confidence": 0.9}, "h", "s",
                                      get_stock_price=lambda ticker: None))
     assert "ABC" not in [s["ticker"] for s in gc._tracked.values()]
 
@@ -179,8 +187,26 @@ def test_start_collection_never_raises_when_contract_lookup_fails(monkeypatch):
     def boom(ticker, price):
         raise RuntimeError("api down")
     monkeypatch.setattr(gc, "_fetch_contracts_meta", boom)
-    asyncio.run(gc.start_collection("ABC", {"magnitude": 0.9, "confidence": 0.9}, "h", "s",
+    ts = datetime.now(timezone.utc)
+    asyncio.run(gc.start_collection(gc.make_signal_id("ABC", ts), ts, "ABC",
+                                     {"magnitude": 0.9, "confidence": 0.9}, "h", "s",
                                      get_stock_price=lambda ticker: 100.0))
+
+
+def test_start_collection_uses_the_caller_supplied_signal_id(monkeypatch):
+    """The id/timestamp stashed on signal["_grid_signal_id"] by bot.py must be the SAME id this
+    module tracks under and writes to the CSV -- not a freshly-minted one -- or the join back to
+    trades.csv breaks."""
+    ts = datetime.now(timezone.utc)
+    sid = gc.make_signal_id("ABC", ts)
+    monkeypatch.setattr(gc, "_fetch_contracts_meta",
+                         lambda ticker, price: {"ABC250101C00100000": (100.0, "2099-01-01", 10, 100)})
+    monkeypatch.setattr(gc, "_regime_snapshot", lambda: {})
+    monkeypatch.setattr(gc, "option_data_client", SimpleNamespace(get_option_snapshot=lambda req: {}))
+    asyncio.run(gc.start_collection(sid, ts, "ABC", {"magnitude": 0.9, "confidence": 0.9}, "h", "s",
+                                     get_stock_price=lambda ticker: 100.0))
+    assert sid in gc._tracked
+    gc._tracked.clear()
 
 
 def test_poll_loop_prune_predicate_catches_expired_and_stale_signals():
