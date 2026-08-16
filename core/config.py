@@ -766,6 +766,20 @@ GRID_POLL_SCHEDULE = [
 
 GRID_SNAPSHOT_CSV = "contract_grid_snapshots.csv"
 
+# Vol-regime proxy (2026-08-15): true CBOE VIX isn't available on this Alpaca plan (no indices
+# data endpoint -- confirmed via a live 404 against /v1beta1/indices/*, and a bare "VIX" stock
+# lookup returns no trade data). VIXY (ProShares VIX Short-Term Futures ETF) is served as a normal
+# equity and tracks the same front-month VIX futures VIX-tracking products are built from, so it's
+# the closest available proxy. Deliberately NOT read as a raw price or vs. a long SMA: VIXY bleeds
+# value over time from contango roll cost and gets reverse-split periodically, so its multi-month
+# price trend is structural decay, not a volatility signal -- a long-window SMA would misread that
+# decay as "always calm". Grid_collector.py instead ranks the latest close against its own trailing
+# GRID_VOL_PROXY_LOOKBACK_DAYS window (a percentile, not a level), which cancels the drift and
+# answers the question that actually matters here: is volatility elevated relative to its own
+# recent past, right now.
+GRID_VOL_PROXY_SYMBOL         = os.environ.get("GRID_VOL_PROXY_SYMBOL", "VIXY")
+GRID_VOL_PROXY_LOOKBACK_DAYS  = int(os.environ.get("GRID_VOL_PROXY_LOOKBACK_DAYS", "20"))
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BACKTEST-ONLY PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════════

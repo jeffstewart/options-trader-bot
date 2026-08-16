@@ -64,6 +64,7 @@ _HEADER = [
     "signal_id", "signal_ts", "ticker", "headline", "source", "scorer_model",
     "magnitude", "confidence", "catalyst", "stock_price_at_signal",
     "spy_price", "spy_sma", "regime_uptrend", "regime_mom_ok", "regime_chop_ok", "regime_dd_density",
+    "vol_proxy_symbol", "vol_proxy_price", "vol_proxy_pctile",
     "passes_news_call_gate", "passes_lotto_gate",
     # per-snapshot
     "snapshot_ts", "minutes_since_signal", "stock_price",
@@ -168,8 +169,37 @@ def _regime_snapshot() -> dict:
                 }
         except Exception as e:
             log.debug("grid collector: regime snapshot failed: %s", e)
+    state.update(_vol_proxy_snapshot())
     _regime_cache.update(date=today, state=state)
     return state
+
+
+def _vol_proxy_snapshot() -> dict:
+    """Real CBOE VIX isn't available on this Alpaca plan (no indices data endpoint) -- VIXY (a
+    normal equity, VIX-futures-based) is the closest available proxy, see config.py comment.
+    Reports the latest close's PERCENTILE RANK within its own trailing
+    GRID_VOL_PROXY_LOOKBACK_DAYS window, not a raw level or an SMA comparison -- VIXY bleeds value
+    over time (contango roll cost, periodic reverse splits), so its own long-run price trend is
+    structural decay, not a volatility signal. A short trailing-window percentile cancels that
+    drift out and answers "is volatility elevated relative to its own recent past" instead. Called
+    once per day via _regime_snapshot's cache, not per signal. Failure returns {} silently, same
+    contract as _regime_snapshot."""
+    sym = cfg.GRID_VOL_PROXY_SYMBOL
+    lookback = cfg.GRID_VOL_PROXY_LOOKBACK_DAYS
+    try:
+        start = datetime.now(timezone.utc) - timedelta(days=int(lookback * 2.5) + 10)
+        resp = stock_data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=sym, timeframe=TimeFrame.Day, start=start, feed="iex"))
+        closes = [float(b.close) for b in (resp.data or {}).get(sym, [])]
+        if len(closes) < 2:
+            return {}
+        window = closes[-lookback:]
+        latest = window[-1]
+        pctile = sum(1 for c in window if c <= latest) / len(window)
+        return {"vol_proxy_symbol": sym, "vol_proxy_price": latest, "vol_proxy_pctile": round(pctile, 3)}
+    except Exception as e:
+        log.debug("grid collector: vol proxy snapshot failed: %s", e)
+        return {}
 
 
 def _current_stock_price(state: dict) -> str:
@@ -241,7 +271,8 @@ def _snapshot_rows(signal_id: str, state: dict) -> list[list]:
         state["source"], state["scorer_model"], state["magnitude"], state["confidence"],
         state["catalyst"], state["stock_price_at_signal"], state["spy_price"], state["spy_sma"],
         state["regime_uptrend"], state["regime_mom_ok"], state["regime_chop_ok"],
-        state["regime_dd_density"], state["passes_news_call_gate"], state["passes_lotto_gate"],
+        state["regime_dd_density"], state["vol_proxy_symbol"], state["vol_proxy_price"],
+        state["vol_proxy_pctile"], state["passes_news_call_gate"], state["passes_lotto_gate"],
     ]
     rows = []
     for chunk in _chunks(symbols, 100):
@@ -302,6 +333,9 @@ async def start_collection(ticker: str, signal: dict, headline: str, source: str
             "regime_mom_ok": regime.get("regime_mom_ok", ""),
             "regime_chop_ok": regime.get("regime_chop_ok", ""),
             "regime_dd_density": regime.get("regime_dd_density", ""),
+            "vol_proxy_symbol": regime.get("vol_proxy_symbol", ""),
+            "vol_proxy_price": regime.get("vol_proxy_price", ""),
+            "vol_proxy_pctile": regime.get("vol_proxy_pctile", ""),
             "passes_news_call_gate": news_call_ok, "passes_lotto_gate": lotto_ok,
             "signal_ts": signal_ts, "last_poll": signal_ts, "last_expiry": last_expiry,
             "contracts_meta": contracts_meta, "get_stock_price": get_stock_price,

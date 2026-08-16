@@ -47,6 +47,7 @@ def _base_state(**overrides):
         "magnitude": 0.6, "confidence": 0.8, "catalyst": 0.5, "stock_price_at_signal": 100.0,
         "spy_price": 550.0, "spy_sma": 540.0, "regime_uptrend": True, "regime_mom_ok": True,
         "regime_chop_ok": True, "regime_dd_density": 0.2,
+        "vol_proxy_symbol": "VIXY", "vol_proxy_price": 18.5, "vol_proxy_pctile": 0.6,
         "passes_news_call_gate": True, "passes_lotto_gate": False,
         "signal_ts": datetime.now(timezone.utc), "get_stock_price": lambda t: 101.0,
     }
@@ -74,6 +75,7 @@ def test_snapshot_rows_computes_mid_and_spread_correctly(monkeypatch):
     assert row["stock_price"] == 101.0
     assert row["scorer_model"] == "llama3.2" and row["catalyst"] == 0.5
     assert row["spy_price"] == 550.0 and row["regime_uptrend"] is True
+    assert row["vol_proxy_symbol"] == "VIXY" and row["vol_proxy_pctile"] == 0.6
     assert row["passes_news_call_gate"] is True and row["passes_lotto_gate"] is False
 
 
@@ -123,8 +125,33 @@ def test_regime_snapshot_caches_per_day_and_never_raises(monkeypatch):
     monkeypatch.setattr(gc, "stock_data_client", SimpleNamespace(get_stock_bars=boom))
     assert gc._regime_snapshot() == {}
     assert gc._regime_snapshot() == {}
-    assert calls["n"] == 1   # second call served from the same-day cache, no second fetch
+    # first call fetches SPY regime + the VIXY vol-proxy (2 sub-fetches, both boom); second call
+    # is served entirely from the same-day cache, no further fetches
+    assert calls["n"] == 2
     gc._regime_cache.update(date=None, state={})
+
+
+def _fake_bars(symbol: str, closes: list):
+    return SimpleNamespace(data={symbol: [SimpleNamespace(close=c) for c in closes]})
+
+
+def test_vol_proxy_snapshot_computes_percentile_rank(monkeypatch):
+    # window rising to a new high -> latest close ranks at the top of its own trailing window,
+    # regardless of the ETP's absolute price level (which drifts from contango decay over time)
+    closes = [10.0, 11.0, 9.0, 12.0, 15.0]
+    monkeypatch.setattr(gc, "stock_data_client", SimpleNamespace(
+        get_stock_bars=lambda req: _fake_bars("VIXY", closes)))
+    out = gc._vol_proxy_snapshot()
+    assert out["vol_proxy_symbol"] == "VIXY"
+    assert out["vol_proxy_price"] == 15.0
+    assert out["vol_proxy_pctile"] == 1.0
+
+
+def test_vol_proxy_snapshot_never_raises_on_fetch_failure(monkeypatch):
+    def boom(req):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(gc, "stock_data_client", SimpleNamespace(get_stock_bars=boom))
+    assert gc._vol_proxy_snapshot() == {}
 
 
 def test_write_rows_creates_header_once(tmp_path, monkeypatch):
