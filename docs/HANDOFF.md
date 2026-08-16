@@ -136,9 +136,24 @@ its own recent past, right now. Config: `GRID_VOL_PROXY_SYMBOL`, `GRID_VOL_PROXY
 - `passes_news_call_gate`/`passes_lotto_gate` are a coarse eligibility label only — they do NOT
   account for the confirm/veto gate, cooldown, liquidity, or position caps. Replaying the real gate
   for every logged signal would cost a real paid API call each time, defeating the point of a
-  free/broad collector. There is also no join key back to `trades.csv` yet for signals that did
-  become real trades — a real gap, deferred (would mean threading a `signal_id` into the shared
-  order-placement path, touched by more than just this module).
+  free/broad collector. The confirm/veto score itself is reconstructable later by rescoring the
+  article, so this was judged an acceptable gap on its own — but a signal can also fail to trade
+  purely on live bot state (cooldown, `MAX_OPEN_POSITIONS`) that rescoring can never recover, which
+  is why the join key below was added rather than relying on rescoring alone.
+- **`grid_signal_id` join key (added 2026-08-15):** `grid_collector.make_signal_id(ticker,
+  signal_ts)` is a pure function; `bot.py`'s `process_signal()` mints the id itself at the moment
+  it decides to collect (not inside `grid_collector.start_collection`, which would mint one a few
+  hundred ms later) and stashes it on `signal["_grid_signal_id"]`. `place_option_trade` /
+  `place_stock_trade` / `place_short_trade` carry it into `_monitored_positions`, and
+  `log_trade`/`log_trade_stock`/`log_closed_trade` write it as a trailing column in
+  `trades.csv`/`closed_trades.csv`. This is what lets analysis compare "what the grid says was the
+  best contract" against what the bot actually bought, its real fill, and its real exit — none of
+  which rescoring the article can reconstruct after the fact. The option-position restart-reload
+  path recovers it from `trades.csv` (same `entry_log` pattern already used for `strategy`), so a
+  position surviving a bot restart still closes with its join key intact. `data/trades.csv` and
+  `data/closed_trades.csv` (gitignored, pre-existing) had their header LINE patched in place to
+  add the column; old rows are simply shorter than the header and read back as `grid_signal_id=""`
+  via `DictReader`, no data was rewritten.
 - **Known Alpaca limitation this collector cannot work around**: there is no historical *bid/ask
   quote* endpoint, only a live one — so this collector is only useful going forward from
   2026-08-XX; it cannot backfill true historical spreads for past signals. Same plan gap rules out

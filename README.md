@@ -106,6 +106,12 @@ raw price or an SMA comparison — VIXY bleeds value over time from contango rol
 reverse splits, so its long-run price trend is structural decay, not a volatility signal; the
 percentile cancels that drift out.
 
+**Join key to real trades (`grid_signal_id`)**: when a collected signal goes on to actually trade,
+`trades.csv`/`closed_trades.csv` carry the same `grid_signal_id` the grid snapshots were logged
+under — so analysis can compare what the grid says was the best available contract against what
+the bot actually bought, its real fill, and its real exit (mechanism/timing/price), not just a
+hypothetical best-in-grid pick with nothing to compare it against.
+
 ### Risk & guardrails (v1)
 
 - **In-process trailing stops are the ONLY protection** — this account can't place exchange-held
