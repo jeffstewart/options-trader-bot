@@ -40,7 +40,9 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionSnapshotRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionSnapshotRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
@@ -55,10 +57,17 @@ log = logging.getLogger(__name__)
 # stateless HTTP clients, not connections that need to be singletons.
 trading_client = TradingClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET, paper=True)
 option_data_client = OptionHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
+stock_data_client = StockHistoricalDataClient(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
 
 _HEADER = [
-    "signal_id", "signal_ts", "ticker", "headline", "source", "magnitude", "confidence",
-    "snapshot_ts", "minutes_since_signal", "symbol", "strike", "expiry", "dte_at_signal",
+    # signal-level (repeated on every row for that signal_id -- easy per-row filtering/joins)
+    "signal_id", "signal_ts", "ticker", "headline", "source", "scorer_model",
+    "magnitude", "confidence", "catalyst", "stock_price_at_signal",
+    "spy_price", "spy_sma", "regime_uptrend", "regime_mom_ok", "regime_chop_ok", "regime_dd_density",
+    "passes_news_call_gate", "passes_lotto_gate",
+    # per-snapshot
+    "snapshot_ts", "minutes_since_signal", "stock_price",
+    "symbol", "strike", "expiry", "dte_at_signal",
     "oi_at_signal", "bid", "ask", "mid", "spread_pct", "iv", "delta", "gamma", "theta", "vega", "rho",
 ]
 
@@ -100,6 +109,79 @@ def should_collect(signal: dict) -> bool:
     except (TypeError, ValueError):
         return False
     return mag * conf >= cfg.GRID_LOG_THRESHOLD
+
+
+def _gate_eligibility(magnitude: float, confidence: float) -> tuple:
+    """Pure-logic replica of bot.py's signal_checks() (news_call) and the lotto thresholds --
+    duplicated rather than imported to keep this module import-independent of bot.py. Tells
+    analysis which live strategy(s) this signal would have qualified for on magnitude/confidence
+    alone. Does NOT account for the confirm/veto gate, cooldown, liquidity, or position caps --
+    replaying those for every logged signal would cost a real gate API call each time, defeating
+    the point of a free/broad collector. Treat as a coarse eligibility label, not "would have
+    actually traded"."""
+    news_call_ok = magnitude >= cfg.MIN_MAGNITUDE and \
+        confidence >= cfg.BASE_CONFIDENCE + (1 - magnitude) * cfg.CONFIDENCE_SLOPE
+    lotto_ok = magnitude >= cfg.LOTTO_MIN_MAGNITUDE and confidence >= cfg.LOTTO_MIN_CONFIDENCE
+    return news_call_ok, lotto_ok
+
+
+_regime_cache: dict = {"date": None, "state": {}}
+
+
+def _regime_snapshot() -> dict:
+    """Cheap, once-per-calendar-day snapshot of SPY's regime state (mirrors bot.py's
+    regime_status(), duplicated here rather than imported to keep this module import-independent
+    of bot.py). "Market state as a whole" for the contract-picker analysis: was this signal fired
+    during an uptrend, a chop, or a downtrend. Captured once at signal time, not re-polled --
+    regime only moves at daily-bar granularity anyway. Failure (or REGIME_FILTER_ENABLED=False)
+    returns an empty dict rather than raising -- market-state columns just come back blank for
+    that signal, never blocks collection."""
+    today = date.today()
+    if _regime_cache["date"] == today:
+        return _regime_cache["state"]
+    state = {}
+    if getattr(cfg, "REGIME_FILTER_ENABLED", True):
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=int(cfg.REGIME_MA_DAYS * 1.6) + 30)
+            resp = stock_data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=cfg.REGIME_INDEX, timeframe=TimeFrame.Day, start=start, feed="iex"))
+            closes = [float(b.close) for b in (resp.data or {}).get(cfg.REGIME_INDEX, [])]
+            if len(closes) >= cfg.REGIME_MA_DAYS:
+                sma = sum(closes[-cfg.REGIME_MA_DAYS:]) / cfg.REGIME_MA_DAYS
+                price = closes[-1]
+                above_sma = price >= sma
+                mom_days = cfg.REGIME_MOMENTUM_DAYS
+                has_mom = mom_days > 0 and len(closes) > mom_days
+                mom_ok = mom_days <= 0 or not has_mom or price >= closes[-1 - mom_days]
+                dd_win = cfg.REGIME_DOWNDAY_WINDOW
+                if dd_win > 0 and len(closes) > dd_win:
+                    dd_density = sum(1 for a, b in zip(closes[-dd_win - 1:-1], closes[-dd_win:])
+                                      if b < a) / dd_win
+                else:
+                    dd_density = 0.0
+                chop_ok = dd_win <= 0 or dd_density < cfg.REGIME_DOWNDAY_MAX_DENSITY
+                state = {
+                    "spy_price": price, "spy_sma": round(sma, 2),
+                    "regime_uptrend": above_sma and mom_ok and chop_ok,
+                    "regime_mom_ok": mom_ok, "regime_chop_ok": chop_ok,
+                    "regime_dd_density": round(dd_density, 3),
+                }
+        except Exception as e:
+            log.debug("grid collector: regime snapshot failed: %s", e)
+    _regime_cache.update(date=today, state=state)
+    return state
+
+
+def _current_stock_price(state: dict) -> str:
+    """Best-effort current underlying price for a snapshot row -- lets analysis track moneyness
+    drift over the life of a tracked signal, not just at entry. Uses the same get_stock_price the
+    caller injected (usually a cache hit; see bot.py's price-stream subscription). Never raises."""
+    try:
+        get_price = state.get("get_stock_price")
+        price = get_price(state["ticker"]) if get_price else None
+        return price if price is not None else ""
+    except Exception:
+        return ""
 
 
 def _fetch_contracts_meta(ticker: str, stock_price: float) -> dict:
@@ -153,6 +235,14 @@ def _snapshot_rows(signal_id: str, state: dict) -> list[list]:
     symbols = list(contracts_meta.keys())
     now = datetime.now(timezone.utc)
     minutes_since = round((now - state["signal_ts"]).total_seconds() / 60, 2)
+    stock_price = _current_stock_price(state)
+    signal_fields = [
+        signal_id, state["signal_ts"].isoformat(), state["ticker"], state["headline"],
+        state["source"], state["scorer_model"], state["magnitude"], state["confidence"],
+        state["catalyst"], state["stock_price_at_signal"], state["spy_price"], state["spy_sma"],
+        state["regime_uptrend"], state["regime_mom_ok"], state["regime_chop_ok"],
+        state["regime_dd_density"], state["passes_news_call_gate"], state["passes_lotto_gate"],
+    ]
     rows = []
     for chunk in _chunks(symbols, 100):
         try:
@@ -166,21 +256,17 @@ def _snapshot_rows(signal_id: str, state: dict) -> list[list]:
             s = snap.get(sym) if snap else None
             q = s.latest_quote if s else None
             if q is None or q.ask_price is None:
-                rows.append([signal_id, state["signal_ts"].isoformat(), state["ticker"],
-                             state["headline"], state["source"], state["magnitude"],
-                             state["confidence"], now.isoformat(), minutes_since, sym, strike,
-                             expiry, dte, oi, "", "", "", "", "", "", "", "", "", ""])
+                rows.append(signal_fields + [now.isoformat(), minutes_since, stock_price, sym,
+                            strike, expiry, dte, oi, "", "", "", "", "", "", "", "", "", ""])
                 continue
             bid, ask = float(q.bid_price or 0), float(q.ask_price or 0)
             mid = round((bid + ask) / 2, 4) if ask > 0 else 0
             spread_pct = round((ask - bid) / mid, 4) if mid > 0 else ""
             g = s.greeks
-            rows.append([
-                signal_id, state["signal_ts"].isoformat(), state["ticker"], state["headline"],
-                state["source"], state["magnitude"], state["confidence"], now.isoformat(),
-                minutes_since, sym, strike, expiry, dte, oi, bid, ask, mid, spread_pct,
-                s.implied_volatility or "", g.delta if g else "", g.gamma if g else "",
-                g.theta if g else "", g.vega if g else "", g.rho if g else "",
+            rows.append(signal_fields + [
+                now.isoformat(), minutes_since, stock_price, sym, strike, expiry, dte, oi,
+                bid, ask, mid, spread_pct, s.implied_volatility or "", g.delta if g else "",
+                g.gamma if g else "", g.theta if g else "", g.vega if g else "", g.rho if g else "",
             ])
     return rows
 
@@ -198,15 +284,27 @@ async def start_collection(ticker: str, signal: dict, headline: str, source: str
         contracts_meta = await loop.run_in_executor(None, _fetch_contracts_meta, ticker, stock_price)
         if not contracts_meta:
             return
+        regime = await loop.run_in_executor(None, _regime_snapshot)
 
         signal_ts = datetime.now(timezone.utc)
         signal_id = f"{ticker}_{signal_ts.strftime('%Y%m%dT%H%M%S%f')}"
         last_expiry = max(date.fromisoformat(exp) for _, exp, _, _ in contracts_meta.values())
+        magnitude = float(signal.get("magnitude", 0))
+        confidence = float(signal.get("confidence", 0))
+        news_call_ok, lotto_ok = _gate_eligibility(magnitude, confidence)
         state = {
             "ticker": ticker, "headline": (headline or "")[:160], "source": source or "",
-            "magnitude": float(signal.get("magnitude", 0)), "confidence": float(signal.get("confidence", 0)),
+            "scorer_model": cfg.OLLAMA_MODEL,
+            "magnitude": magnitude, "confidence": confidence,
+            "catalyst": signal.get("catalyst", ""), "stock_price_at_signal": stock_price,
+            "spy_price": regime.get("spy_price", ""), "spy_sma": regime.get("spy_sma", ""),
+            "regime_uptrend": regime.get("regime_uptrend", ""),
+            "regime_mom_ok": regime.get("regime_mom_ok", ""),
+            "regime_chop_ok": regime.get("regime_chop_ok", ""),
+            "regime_dd_density": regime.get("regime_dd_density", ""),
+            "passes_news_call_gate": news_call_ok, "passes_lotto_gate": lotto_ok,
             "signal_ts": signal_ts, "last_poll": signal_ts, "last_expiry": last_expiry,
-            "contracts_meta": contracts_meta,
+            "contracts_meta": contracts_meta, "get_stock_price": get_stock_price,
         }
         rows = await loop.run_in_executor(None, _snapshot_rows, signal_id, state)
         _write_rows(rows)

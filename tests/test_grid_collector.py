@@ -41,12 +41,24 @@ def _fake_snapshot(bid=1.0, ask=1.2, iv=0.35, delta=0.3):
     return SimpleNamespace(latest_quote=quote, latest_trade=None, implied_volatility=iv, greeks=greeks)
 
 
-def test_snapshot_rows_computes_mid_and_spread_correctly(monkeypatch):
+def _base_state(**overrides):
     state = {
-        "ticker": "ABC", "headline": "h", "source": "s", "magnitude": 0.6, "confidence": 0.8,
-        "signal_ts": datetime.now(timezone.utc) - timedelta(minutes=5),
-        "contracts_meta": {"ABC250101C00100000": (100.0, "2025-01-01", 10, 250)},
+        "ticker": "ABC", "headline": "h", "source": "s", "scorer_model": "llama3.2",
+        "magnitude": 0.6, "confidence": 0.8, "catalyst": 0.5, "stock_price_at_signal": 100.0,
+        "spy_price": 550.0, "spy_sma": 540.0, "regime_uptrend": True, "regime_mom_ok": True,
+        "regime_chop_ok": True, "regime_dd_density": 0.2,
+        "passes_news_call_gate": True, "passes_lotto_gate": False,
+        "signal_ts": datetime.now(timezone.utc), "get_stock_price": lambda t: 101.0,
     }
+    state.update(overrides)
+    return state
+
+
+def test_snapshot_rows_computes_mid_and_spread_correctly(monkeypatch):
+    state = _base_state(
+        signal_ts=datetime.now(timezone.utc) - timedelta(minutes=5),
+        contracts_meta={"ABC250101C00100000": (100.0, "2025-01-01", 10, 250)},
+    )
     monkeypatch.setattr(gc, "option_data_client", SimpleNamespace(
         get_option_snapshot=lambda req: {"ABC250101C00100000": _fake_snapshot(bid=1.0, ask=1.2)}))
     rows = gc._snapshot_rows("sig1", state)
@@ -59,16 +71,16 @@ def test_snapshot_rows_computes_mid_and_spread_correctly(monkeypatch):
     assert abs(row["spread_pct"] - (0.2 / 1.1)) < 1e-4
     assert row["iv"] == 0.35 and row["delta"] == 0.3
     assert 4.9 <= row["minutes_since_signal"] <= 5.1
+    assert row["stock_price"] == 101.0
+    assert row["scorer_model"] == "llama3.2" and row["catalyst"] == 0.5
+    assert row["spy_price"] == 550.0 and row["regime_uptrend"] is True
+    assert row["passes_news_call_gate"] is True and row["passes_lotto_gate"] is False
 
 
 def test_snapshot_rows_missing_quote_still_writes_a_row(monkeypatch):
     """A contract that's disappeared from the tape must show up as a blank-quote row, not
     silently vanish from the dataset -- that absence is itself the finding."""
-    state = {
-        "ticker": "ABC", "headline": "h", "source": "s", "magnitude": 0.6, "confidence": 0.8,
-        "signal_ts": datetime.now(timezone.utc),
-        "contracts_meta": {"ABC250101C00100000": (100.0, "2025-01-01", 10, None)},
-    }
+    state = _base_state(contracts_meta={"ABC250101C00100000": (100.0, "2025-01-01", 10, None)})
     monkeypatch.setattr(gc, "option_data_client",
                          SimpleNamespace(get_option_snapshot=lambda req: {}))
     rows = gc._snapshot_rows("sig1", state)
@@ -78,15 +90,41 @@ def test_snapshot_rows_missing_quote_still_writes_a_row(monkeypatch):
 
 
 def test_snapshot_rows_never_raises_on_fetch_failure(monkeypatch):
-    state = {
-        "ticker": "ABC", "headline": "h", "source": "s", "magnitude": 0.6, "confidence": 0.8,
-        "signal_ts": datetime.now(timezone.utc),
-        "contracts_meta": {"X": (100.0, "2025-01-01", 10, 100)},
-    }
+    state = _base_state(contracts_meta={"X": (100.0, "2025-01-01", 10, 100)})
     def boom(req):
         raise RuntimeError("network down")
     monkeypatch.setattr(gc, "option_data_client", SimpleNamespace(get_option_snapshot=boom))
     assert gc._snapshot_rows("sig1", state) == []
+
+
+def test_current_stock_price_never_raises_and_blanks_on_failure():
+    state = _base_state(get_stock_price=lambda t: (_ for _ in ()).throw(RuntimeError("down")))
+    assert gc._current_stock_price(state) == ""
+    state2 = _base_state(get_stock_price=lambda t: None)
+    assert gc._current_stock_price(state2) == ""
+
+
+def test_gate_eligibility_matches_config_thresholds():
+    news_call_ok, lotto_ok = gc._gate_eligibility(0.99, 0.99)
+    assert news_call_ok is True and lotto_ok is True
+    news_call_ok, lotto_ok = gc._gate_eligibility(0.01, 0.01)
+    assert news_call_ok is False and lotto_ok is False
+    # right at the news_call magnitude floor but confidence too low for the dynamic floor
+    news_call_ok, _ = gc._gate_eligibility(config.MIN_MAGNITUDE, 0.0)
+    assert news_call_ok is False
+
+
+def test_regime_snapshot_caches_per_day_and_never_raises(monkeypatch):
+    gc._regime_cache.update(date=None, state={})
+    calls = {"n": 0}
+    def boom(req):
+        calls["n"] += 1
+        raise RuntimeError("network down")
+    monkeypatch.setattr(gc, "stock_data_client", SimpleNamespace(get_stock_bars=boom))
+    assert gc._regime_snapshot() == {}
+    assert gc._regime_snapshot() == {}
+    assert calls["n"] == 1   # second call served from the same-day cache, no second fetch
+    gc._regime_cache.update(date=None, state={})
 
 
 def test_write_rows_creates_header_once(tmp_path, monkeypatch):
@@ -142,12 +180,11 @@ def test_poll_loop_skips_entirely_when_market_closed():
     """The poller must not poll (or advance state) while the market is closed -- overnight/weekend
     hours would just waste API calls for zero new information."""
     gc._tracked.clear()
-    gc._tracked["sig1"] = {
-        "ticker": "ABC", "headline": "h", "source": "s", "magnitude": 0.5, "confidence": 0.5,
-        "signal_ts": datetime.now(timezone.utc) - timedelta(hours=1),
-        "last_poll": datetime.now(timezone.utc) - timedelta(hours=1),
-        "last_expiry": date.today() + timedelta(days=10), "contracts_meta": {},
-    }
+    gc._tracked["sig1"] = _base_state(
+        signal_ts=datetime.now(timezone.utc) - timedelta(hours=1),
+        last_poll=datetime.now(timezone.utc) - timedelta(hours=1),
+        last_expiry=date.today() + timedelta(days=10), contracts_meta={},
+    )
     before = dict(gc._tracked["sig1"])
 
     async def run_briefly():
