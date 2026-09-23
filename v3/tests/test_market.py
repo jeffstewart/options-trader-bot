@@ -121,3 +121,4 @@ def test_regime_gate_fails_on_excessive_chop(monkeypatch):
     res = mkt.evaluate_regime()
     assert res["chop_ok"] is False
     assert res["passes_regime"] is False
+

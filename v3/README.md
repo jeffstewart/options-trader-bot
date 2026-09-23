@@ -128,3 +128,4 @@ v3 contains an isolated unit test suite covering filters, market regime math, da
 * **`test_execution.py`** (6 tests): Validates contract guardrails (spread cap, OI floor, root symbol), 30-minute timed horizon exit triggers, and state persistence.
 * **`test_news_db.py`** (4 tests): Validates SQLite schema, deduplication, point-in-time isolation, and 24h market sentiment aggregation.
 * **`test_scoring_prompt.py`** (5 tests): Validates prompt assembly with and without context, JSON extraction with code fences, and Gemini daily quota guardrails.
+

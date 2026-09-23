@@ -118,3 +118,4 @@ def test_genuine_catalysts_pass_cleanly(headline, body):
 
     soft_hit = filters.soft_catalyst_hit(headline, body)
     assert soft_hit is None, f"Expected no soft catalyst hit, but matched: {soft_hit}"
+
