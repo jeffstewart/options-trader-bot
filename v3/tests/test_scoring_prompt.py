@@ -96,3 +96,26 @@ Hope this helps!"""
     assert res["is_stale_echo"] is True
     assert res["magnitude"] == 0.20
 
+
+def test_gemini_quota_tracking(tmp_path, monkeypatch):
+    """Verify Gemini daily call cap enforcement and exhaustion marking."""
+    usage_file = tmp_path / "gemini_usage.json"
+    monkeypatch.setattr(scoring, "GEMINI_USAGE_FILE", usage_file)
+    monkeypatch.setattr(scoring.cfg, "GEMINI_MAX_DAILY_CALLS", 5)
+
+    # 1. Under cap -> allowed
+    assert scoring._check_gemini_daily_limit() is True
+
+    # 2. Record calls up to cap
+    for _ in range(5):
+        scoring._record_gemini_call(exhausted=False)
+
+    # 3. Reached cap -> blocked
+    assert scoring._check_gemini_daily_limit() is False
+
+    # 4. API exhaustion flag immediately sets cap
+    monkeypatch.setattr(scoring.cfg, "GEMINI_MAX_DAILY_CALLS", 100)
+    scoring._record_gemini_call(exhausted=True)
+    assert scoring._check_gemini_daily_limit() is False
+
+

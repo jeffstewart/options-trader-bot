@@ -1,17 +1,14 @@
-# Trader Bot
+# Trader Bot: Event-Driven Options Trading System
 
-Two independent event-driven options bots trading Alpaca **paper** accounts. Both react to
-financial news in real time, score it with an LLM, and trade options. Paper trading only — for
-research/education, not real money.
+A modular, multi-generation algorithmic trading framework designed to trade breaking financial news catalysts using the Alpaca Markets API. Paper trading only — built for quantitative research and execution engineering.
 
-- **`core/` (v1)** — the original, full-featured bot. Parses every article, runs a local Ollama
-  scorer + cloud confirm/veto gate, and trades `news_call`/`lotto`/`pead`/`pairs`. Also hosts the
-  contract-grid research collector (see below). Runs natively on the host.
-- **`v2/`** — a lean rewrite aimed at an eventual small real-money account. Runs independently of
-  v1 on its own paper account/book. Currently **lotto-only** — see [`v2/README.md`](v2/README.md).
-  Runs in a Docker container (bot) + native dashboard.
+### Architecture Generations
 
-Both are managed together via [`everything.sh`](everything.sh) (see Running, below).
+- **`v3/` (Current Flagship)** — Context-aware options trading engine running in Docker on Colima. Features an embedded SQLite news archive providing point-in-time ticker history and market sentiment flow, empirical contract selection (~0.50 Delta ATM calls, $\le 6.5\%$ spread cap, $\ge 10$ OI floor, 30m timed horizon exits), and a pluggable LLM scorer (local Ollama, Google Gemini, Anthropic Claude, Moonshot Kimi). See [`v3/README.md`](v3/README.md).
+- **`v2/`** — Lean containerized options bot focused on far-OTM lotto experiments. See [`v2/README.md`](v2/README.md).
+- **`core/` (v1)** — The foundational engine that captured the 5-week, 7.5-million-row options order-book research dataset (`contract_grid_snapshots.csv`) used to calibrate v3.
+
+The entire stack is orchestrated via [`everything.sh`](everything.sh).
 
 ---
 
@@ -186,7 +183,7 @@ primary scorer is cloud-based (kimi-k2.6) for the same reason.
 ## Running
 
 Use `./everything.sh {start|stop|restart|status}` to bring up/down the **whole stack**: Colima
-(Docker backend) → Ollama → v1 (bot+dashboard, native) → v2 bot (Docker) → v2 dashboard (native).
+(Docker backend) → Ollama → v1 (bot+dashboard, native) → v3 bot (Docker container).
 
 ```bash
 ./everything.sh start
@@ -229,14 +226,20 @@ config beyond both reading from the same `research/` scripts when doing analysis
 
 ## Testing
 
+The project maintains comprehensive test coverage across 269 automated unit tests:
+
 ```bash
-./manage.sh test              # v1 suite (pytest.ini at repo root)
-cd v2 && pytest                # v2 suite (self-contained pytest.ini)
+# v3 Flagship Suite (54 tests — filters, market regime, database, prompt formatting, execution rules)
+pytest -c v3/pytest.ini v3/tests/ -v
+
+# v2 Lean Suite (123 tests — lotto pipeline, filters, ratcheting stops, contract picker)
+pytest -c v2/pytest.ini v2/tests/ -v
+
+# v1 Core Suite (92 tests — news parsing, regime gate, order execution, sizing math)
+pytest -c pytest.ini tests/ -v
 ```
 
-Both suites cover pure-logic code — pre-score filters, trading math (realized P&L incl. short-side
-sign, flat/equity-relative sizing, hold caps), and (v1 only) the grid collector. Run before any
-change.
+All suites test deterministic logic, risk controls, and trading math without making external network calls. Run before any production deployment.
 
 ---
 

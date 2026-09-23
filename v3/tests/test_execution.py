@@ -47,3 +47,90 @@ def test_passes_contract_guardrails_root_symbol():
     c_wrong_root = SimpleNamespace(tradable=True, root_symbol="ABC1", strike_price="50.0", open_interest=50)
     assert execution._passes_contract_guardrails(c_wrong_root, quote, stock_price, "ABC") is False
 
+
+def test_monitor_open_positions_triggers_horizon_exit(monkeypatch, tmp_path):
+    """Verify monitor triggers timed exit when holding period exceeds horizon."""
+    from datetime import datetime, timedelta, timezone
+    from v3 import market as mkt
+
+    closed_signals = []
+    monkeypatch.setattr(execution, "close_option_position",
+                        lambda sym, reason: closed_signals.append((sym, reason)))
+
+    # Position entered 35 minutes ago (horizon is 30m)
+    now = datetime.now(timezone.utc)
+    entry_35m_ago = (now - timedelta(minutes=35)).isoformat()
+    mkt._monitored_positions = {
+        "TEST_SYM": {
+            "symbol": "TEST_SYM",
+            "underlying": "TEST",
+            "qty": 1,
+            "entry_price": 2.00,
+            "entry_time": entry_35m_ago,
+            "peak_price": 2.00,
+        }
+    }
+
+    execution.monitor_open_positions()
+    assert len(closed_signals) == 1
+    assert closed_signals[0] == ("TEST_SYM", "horizon_30m")
+
+
+def test_monitor_open_positions_holds_under_horizon(monkeypatch):
+    """Verify monitor leaves position open when holding period is under 30 minutes."""
+    from datetime import datetime, timedelta, timezone
+    from v3 import market as mkt
+
+    closed_signals = []
+    monkeypatch.setattr(execution, "close_option_position",
+                        lambda sym, reason: closed_signals.append((sym, reason)))
+    monkeypatch.setattr(mkt, "get_option_quote",
+                        lambda sym: {"bid": 2.50, "ask": 2.60, "mid": 2.55, "spread_pct": 0.04})
+
+    # Position entered 10 minutes ago
+    now = datetime.now(timezone.utc)
+    entry_10m_ago = (now - timedelta(minutes=10)).isoformat()
+    mkt._monitored_positions = {
+        "HOLD_SYM": {
+            "symbol": "HOLD_SYM",
+            "underlying": "HOLD",
+            "qty": 1,
+            "entry_price": 2.00,
+            "entry_time": entry_10m_ago,
+            "peak_price": 2.00,
+        }
+    }
+
+    execution.monitor_open_positions()
+    assert len(closed_signals) == 0
+    # Peak price updated to 2.50
+    assert mkt._monitored_positions["HOLD_SYM"]["peak_price"] == 2.50
+
+
+def test_save_and_load_state_roundtrip(tmp_path, monkeypatch):
+    """Verify state file serialization and deserialization."""
+    from v3 import market as mkt
+
+    state_file = tmp_path / "bot_state.json"
+    monkeypatch.setattr(execution, "STATE_FILE", state_file)
+
+    test_pos = {
+        "TEST_ROUNDTRIP": {
+            "symbol": "TEST_ROUNDTRIP",
+            "underlying": "TRIP",
+            "qty": 2,
+            "entry_price": 1.50,
+            "entry_time": "2026-09-22T18:00:00+00:00",
+            "peak_price": 1.80,
+        }
+    }
+    mkt._monitored_positions = test_pos
+    execution.save_state()
+
+    # Clear and reload
+    mkt._monitored_positions = {}
+    execution.load_state()
+    assert "TEST_ROUNDTRIP" in mkt._monitored_positions
+    assert mkt._monitored_positions["TEST_ROUNDTRIP"]["entry_price"] == 1.50
+
+

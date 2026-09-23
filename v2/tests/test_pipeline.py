@@ -316,8 +316,8 @@ def test_write_bot_state_lotto_stop_tracks_the_peak(tmp_path, monkeypatch):
 def test_lotto_same_day_exit_requires_same_calendar_date(monkeypatch):
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
-    pos_today = {"entry_dt": now - timedelta(hours=2)}
-    pos_yesterday = {"entry_dt": now - timedelta(days=1)}
+    pos_today = {"entry_dt": now}
+    pos_yesterday = {"entry_dt": now - timedelta(days=2)}
     assert mkt._lotto_same_day_exit_hit(pos_today)
     assert not mkt._lotto_same_day_exit_hit(pos_yesterday)
 

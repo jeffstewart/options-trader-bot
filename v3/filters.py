@@ -46,8 +46,7 @@ PRESCORE_SKIP_REGEXES = (
     re.compile(r"\boutperformed\b[^.]{0,40}\bover the (?:past|last)\s+\d+\s+(?:year|month)", re.I),
     # intraday listicle
     re.compile(r"\b\d+\s[\w\s-]{0,30}stocks moving in \w+day", re.I),
-    # reactive already-moved recap questions
-    re.compile(r"why is .{0,40}(stock|shares).{0,20}(surg|gain|jump|ris|soar|climb|trend|mov)", re.I),
+    re.compile(r"why\s+(?:is\s+)?.{0,40}(stock|shares)\s*(?:is|are)?\s*.{0,20}(surg|gain|jump|ris|soar|climb|trend|mov)", re.I),
     re.compile(r"(stock|shares)\s+(is |are )?(surg\w+|rall\w+|climb\w+|soar\w+|jump\w+|trending higher|gaining).{0,30}(what|here's why|why)", re.I),
     # acquirer-side speculative deal talk
     re.compile(r"\bin (talks|discussions) to (buy|acquire)\b", re.I),
