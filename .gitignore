@@ -28,6 +28,13 @@ __pycache__/
 # ── Trade data / CSV outputs (live trade history is machine-local data) ───
 *.csv
 
+# ── SQLite databases ──────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
 # ── Generated reports ─────────────────────────────────────────────────────
 *.html
 

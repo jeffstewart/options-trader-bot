@@ -1,0 +1,9 @@
+# v3 runtime dependencies — containerized execution on Colima
+aiohttp==3.13.5
+alpaca-py==0.43.4
+anthropic==0.116.0
+beautifulsoup4==4.14.3
+feedparser==6.0.12
+openai==2.38.0
+python-dotenv==1.2.2
+requests==2.32.3

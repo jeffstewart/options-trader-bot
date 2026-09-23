@@ -1,0 +1,26 @@
+# Trader Bot v3 — single always-on container on Colima
+# Bind mounts ./data and ./logs to preserve historical news DB and state across restarts.
+services:
+  v3-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Reach host Ollama service from within Colima/Docker container
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - TRADER_V3_DATA_DIR=/app/data
+      - TRADER_V3_LOG_DIR=/app/logs
+      - PYTHONPATH=/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Use public DNS to prevent Mac multi-subnet DNS proxy flakiness
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    dns_opt:
+      - timeout:2
+      - attempts:3
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs

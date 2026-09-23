@@ -1,7 +1,7 @@
 #!/bin/zsh
 # everything.sh — single entry point to start/stop/status the FULL stack:
 #   ollama (native, host)  ·  v1 bot+dashboard (native, host, via manage.sh)
-#   v2 bot (docker)        ·  v2 dashboard (native, host, NOT containerized — see v2/docker-compose.yml)
+#   v3 bot (docker, colima)
 #
 # Built 2026-08-03 after both bots + ollama got shut off over a weekend to free RAM and had to be
 # restarted piecemeal by hand. This wraps that into one command so nothing gets left half-up.
@@ -78,24 +78,25 @@ status_all() {
   is_up $ROOT/data/ollama.pid && echo "  UP (pid $(cat $ROOT/data/ollama.pid))" || echo "  down"
   echo "── v1 (bot + dashboard) ──"
   $ROOT/manage.sh status
-  echo "── v2-bot (docker) ──"
+  echo "── v3-bot (docker) ──"
   if docker info >/dev/null 2>&1; then
-    ( cd $ROOT/v2 && docker compose ps )
+    ( cd $ROOT/v3 && docker compose ps )
   else
     echo "  down (docker daemon not running)"
   fi
-  echo "── v2-dashboard ──"
-  is_up $ROOT/v2/data/dashboard.pid && echo "  UP (pid $(cat $ROOT/v2/data/dashboard.pid))" || echo "  down"
+  if is_up $ROOT/v2/data/dashboard.pid; then
+    echo "── v2-dashboard (legacy) ──"
+    echo "  UP (pid $(cat $ROOT/v2/data/dashboard.pid))"
+  fi
 }
 
 case "$1" in
   start)
     echo "Starting full stack…"
-    start_docker                                    # v2-bot needs this before `docker compose up`
+    start_docker                                    # v3-bot needs this before `docker compose up`
     start_ollama                                    # bots' ticker-corrector calls this — bring it up first
     $ROOT/manage.sh start >/dev/null && echo "  v1 (bot+dashboard): started"
-    ( cd $ROOT/v2 && docker compose up -d >/dev/null ) && echo "  v2-bot (docker): started"
-    start_v2_dash
+    ( cd $ROOT/v3 && docker compose up -d >/dev/null ) && echo "  v3-bot (docker): started"
     sleep 2
     echo
     status_all ;;
@@ -106,9 +107,10 @@ case "$1" in
     # still be up for `docker compose down` above to work at all).
     echo "Stopping full stack (graceful)…"
     if docker info >/dev/null 2>&1; then
-      ( cd $ROOT/v2 && docker compose down ) && echo "  v2-bot (docker): stopped (SIGTERM, graceful)"
+      ( cd $ROOT/v3 && docker compose down ) 2>/dev/null && echo "  v3-bot (docker): stopped (SIGTERM, graceful)"
+      ( cd $ROOT/v2 && docker compose down ) 2>/dev/null || true
     else
-      echo "  v2-bot (docker): already down (docker daemon not running)"
+      echo "  v3-bot (docker): already down (docker daemon not running)"
     fi
     wait_for_death $ROOT/data/bot.pid "v1-bot"
     wait_for_death $ROOT/data/dashboard.pid "v1-dashboard"

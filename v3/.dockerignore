@@ -1,0 +1,16 @@
+# Exclude secrets, build artifacts, local data, and caches from image build context
+.env
+.env.bak
+data/
+logs/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+.dockerignore
