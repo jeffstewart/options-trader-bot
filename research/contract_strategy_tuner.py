@@ -55,9 +55,10 @@ Usage:
 """
 
 import sys
+from collections import Counter
+from itertools import product
 import numpy as np
 import pandas as pd
-from itertools import product
 from scipy.stats import spearmanr
 
 
@@ -66,12 +67,105 @@ from scipy.stats import spearmanr
 # ----------------------------------------------------------------------------
 
 def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False, parse_dates=["signal_ts", "snapshot_ts"])
+    """Load the full dataset (convenience function for small files or interactive exploration).
+    For large snapshot files (>100MB), prefer load_entry_snapshot_and_stats and
+    load_selected_paths to stream in chunks and avoid memory exhaustion.
+    """
+    df = pd.read_csv(path, low_memory=False)
+    if "signal_ts" in df.columns:
+        df["signal_ts"] = pd.to_datetime(df["signal_ts"])
+    if "snapshot_ts" in df.columns:
+        df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"])
+    for col in df.select_dtypes(include=["float64"]).columns:
+        df[col] = df[col].astype("float32")
     df = df.sort_values(["signal_id", "symbol", "minutes_since_signal"]).reset_index(drop=True)
     return df
 
 
+def load_entry_snapshot_and_stats(path: str, chunksize: int = 500_000) -> tuple[pd.DataFrame, int, pd.Series]:
+    """Pass 1: Stream the CSV in chunks.
+    Extract the first snapshot row per (signal_id, symbol) to form entry_df.
+    Simultaneously track total rows and signal snapshot counts without keeping
+    the full multi-gigabyte table in memory.
+    """
+    entry_chunks = []
+    seen = set()
+    total_rows = 0
+    signal_counts = Counter()
+
+    for chunk in pd.read_csv(path, chunksize=chunksize, low_memory=False):
+        total_rows += len(chunk)
+        signal_counts.update(chunk["signal_id"].value_counts().to_dict())
+
+        c_entry = chunk.drop_duplicates(subset=["signal_id", "symbol"])
+        mask = ~c_entry.set_index(["signal_id", "symbol"]).index.isin(seen)
+        new_entries = c_entry[mask]
+        if len(new_entries) > 0:
+            seen.update(zip(new_entries["signal_id"], new_entries["symbol"]))
+            entry_chunks.append(new_entries)
+
+    entry_df = pd.concat(entry_chunks, ignore_index=True)
+    if "signal_ts" in entry_df.columns:
+        entry_df["signal_ts"] = pd.to_datetime(entry_df["signal_ts"])
+    if "snapshot_ts" in entry_df.columns:
+        entry_df["snapshot_ts"] = pd.to_datetime(entry_df["snapshot_ts"])
+    entry_df["row_in_group"] = 0
+
+    # Downcast float64 to float32 to minimize memory footprint
+    for col in entry_df.select_dtypes(include=["float64"]).columns:
+        entry_df[col] = entry_df[col].astype("float32")
+
+    rows_per_signal = pd.Series(signal_counts)
+    return entry_df, total_rows, rows_per_signal
+
+
+def load_selected_paths(path: str, selected_pairs: set, chunksize: int = 500_000) -> pd.DataFrame:
+    """Pass 2: Stream the CSV in chunks, extracting snapshot rows ONLY for
+    the contracts that were actually selected by at least one selection rule.
+    Only loads the essential path columns: signal_id, symbol, minutes_since_signal, bid, ask.
+    """
+    selected_signals = {s for s, _ in selected_pairs}
+    path_cols = ["signal_id", "symbol", "minutes_since_signal", "bid", "ask"]
+    dtypes = {
+        "minutes_since_signal": "float32",
+        "bid": "float32",
+        "ask": "float32",
+    }
+
+    path_chunks = []
+    for chunk in pd.read_csv(path, usecols=path_cols, chunksize=chunksize, dtype=dtypes, low_memory=False):
+        sub = chunk[chunk["signal_id"].isin(selected_signals)]
+        if len(sub) > 0:
+            pairs = list(zip(sub["signal_id"], sub["symbol"]))
+            mask = [p in selected_pairs for p in pairs]
+            matched = sub[mask]
+            if len(matched) > 0:
+                path_chunks.append(matched)
+
+    if path_chunks:
+        paths_df = pd.concat(path_chunks, ignore_index=True)
+        paths_df = paths_df.sort_values(["signal_id", "symbol", "minutes_since_signal"]).reset_index(drop=True)
+    else:
+        paths_df = pd.DataFrame({
+            "signal_id": pd.Series(dtype="str"),
+            "symbol": pd.Series(dtype="str"),
+            "minutes_since_signal": pd.Series(dtype="float32"),
+            "bid": pd.Series(dtype="float32"),
+            "ask": pd.Series(dtype="float32"),
+        })
+
+    paths_df = prep_contract_paths(paths_df)
+    return paths_df
+
+
 def prep_contract_paths(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) == 0:
+        for c in ["entry_price", "bid_peak", "drawdown_from_peak", "ret_from_entry"]:
+            df[c] = pd.Series(dtype="float32")
+        for c in ["row_in_group", "group_size"]:
+            df[c] = pd.Series(dtype="int64")
+        return df
+
     g = df.groupby(["signal_id", "symbol"], sort=False)
     df["entry_price"] = g["ask"].transform("first")
     df["bid_peak"] = g["bid"].cummax()
@@ -404,17 +498,17 @@ def rf_permutation_significance(feats: pd.DataFrame, pnl: pd.Series,
     if len(X) < 15:
         return pd.DataFrame({"feature": feats.columns, "rf_importance": np.nan, "p_value": np.nan})
 
-    rf = RandomForestRegressor(n_estimators=200, max_depth=4, min_samples_leaf=5, random_state=random_state)
+    rf = RandomForestRegressor(n_estimators=200, max_depth=4, min_samples_leaf=5, n_jobs=-1, random_state=random_state)
     rf.fit(X, y)
-    observed = permutation_importance(rf, X, y, n_repeats=20, random_state=random_state).importances_mean
+    observed = permutation_importance(rf, X, y, n_repeats=20, n_jobs=-1, random_state=random_state).importances_mean
 
     null_importances = np.zeros((n_shuffles, X.shape[1]))
     for i in range(n_shuffles):
         y_shuff = rng.permutation(y)
         rf_null = RandomForestRegressor(n_estimators=200, max_depth=4, min_samples_leaf=5,
-                                         random_state=rng.randint(1_000_000))
+                                         n_jobs=-1, random_state=rng.randint(1_000_000))
         rf_null.fit(X, y_shuff)
-        pi_null = permutation_importance(rf_null, X, y_shuff, n_repeats=3, random_state=random_state)
+        pi_null = permutation_importance(rf_null, X, y_shuff, n_repeats=3, n_jobs=-1, random_state=random_state)
         null_importances[i] = pi_null.importances_mean
 
     p_values = (np.sum(null_importances >= observed, axis=0) + 1) / (n_shuffles + 1)
@@ -649,13 +743,19 @@ def notable_trades(df: pd.DataFrame, exits: pd.DataFrame, ids, keep_rule: pd.Ser
     standout trade (good or bad) can actually be looked up and sanity-checked
     instead of just trusted as a number in an average."""
     sub = exits[exits["signal_id"].isin(ids)].copy()
-    info = df.groupby("signal_id")[["ticker", "headline", "signal_ts"]].first()
-    sub = sub.merge(info, on="signal_id", how="left")
+    info_cols = [c for c in ["ticker", "headline", "signal_ts"] if c in df.columns]
+    if info_cols:
+        info = df.groupby("signal_id")[info_cols].first()
+        sub = sub.merge(info, on="signal_id", how="left")
+    for col in ["ticker", "headline"]:
+        if col not in sub.columns:
+            sub[col] = ""
     sub["kept_by_rule_gate"] = sub["signal_id"].map(keep_rule.to_dict()).fillna(False)
     sub["kept_by_model_gate"] = sub["signal_id"].map(keep_model.to_dict()).fillna(False)
     sub = sub.sort_values("pnl_pct", ascending=False)
     cols = ["signal_id", "ticker", "headline", "pnl_pct", "exit_reason", "minutes_held",
             "kept_by_rule_gate", "kept_by_model_gate"]
+    cols = [c for c in cols if c in sub.columns]
     best = sub.head(n)[cols]
     worst = sub.tail(n)[cols].sort_values("pnl_pct")
     return best, worst
@@ -667,12 +767,10 @@ def notable_trades(df: pd.DataFrame, exits: pd.DataFrame, ids, keep_rule: pd.Ser
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else "contract_grid_snapshots.csv"
-    print(f"Loading {path} ...")
-    df = load_data(path)
-    df = prep_contract_paths(df)
-    entry_df = entry_snapshot(df)
-    signal_meta = get_signal_meta(df)
-    print(f"Loaded {len(df):,} rows, {len(signal_meta)} signals, {df['ticker'].nunique()} tickers.")
+    print(f"Loading {path} (Pass 1: entry snapshots and dataset diagnostics) ...")
+    entry_df, total_rows, rows_per_signal = load_entry_snapshot_and_stats(path)
+    signal_meta = get_signal_meta(entry_df)
+    print(f"Loaded {total_rows:,} total rows across {len(signal_meta)} signals, {entry_df['ticker'].nunique()} tickers.")
 
     train_ids, test_ids = chronological_split(signal_meta, test_frac=0.3)
     print(f"Chronological split: {len(train_ids)} train signals, {len(test_ids)} test signals.")
@@ -692,7 +790,6 @@ if __name__ == "__main__":
     else:
         print("No calendar days with zero signals in range.")
 
-    rows_per_signal = df.groupby("signal_id").size()
     print(f"Rows (snapshots) per signal: mean={rows_per_signal.mean():.0f}, "
           f"median={rows_per_signal.median():.0f}, min={rows_per_signal.min()}, max={rows_per_signal.max()}")
     print("  If this differs a lot from a previous run, the bot's polling interval or tracked-window")
@@ -700,17 +797,30 @@ if __name__ == "__main__":
     print("  trailing stops) less comparable between older and newer signals within this same file.")
 
     for flag in ["regime_uptrend", "regime_mom_ok", "regime_chop_ok"]:
-        if flag in df.columns:
-            vc = df.groupby("signal_id")[flag].first().value_counts()
+        if flag in entry_df.columns:
+            vc = entry_df.groupby("signal_id")[flag].first().value_counts()
             print(f"  {flag} across signals: {dict(vc)}")
 
+    # Identify candidate contracts selected by any selection rule
+    all_selected_pairs = set()
+    for sel_name, rule_fn in SELECTION_RULES.items():
+        picked = rule_fn(entry_df)
+        all_selected_pairs.update(zip(picked.index, picked.values))
+
+    print(f"\nPass 2: Loading price paths for {len(all_selected_pairs):,} selected contracts ...")
+    paths_df = load_selected_paths(path, all_selected_pairs)
+    print(f"Extracted {len(paths_df):,} path snapshots ({paths_df.memory_usage(deep=True).sum() / 1e6:.1f} MB in RAM).")
+
+    if len(paths_df) == 0:
+        print("\nNo price paths found for candidate contracts in dataset (missing bid/ask data or empty chain). Exiting.")
+        sys.exit(0)
 
     print("\nRanking selection x exit combos on TRAIN data only ...")
     train_rank_rows = []
     for sel_name in SELECTION_RULES:
         picked = SELECTION_RULES[sel_name](entry_df)
         picked_df = picked.reset_index()
-        paths = df.merge(picked_df, on=["signal_id", "symbol"], how="inner")
+        paths = paths_df.merge(picked_df, on=["signal_id", "symbol"], how="inner")
         for exit_name in EXIT_STRATEGIES:
             exits = simulate(paths, exit_name)
             stats = evaluate_split(exits, train_ids)
@@ -726,7 +836,7 @@ if __name__ == "__main__":
 
     print(f"\nRunning feature discovery + gate fitting for {best_sel} + {best_exit} ...")
     results, discovery, rule_gate, model_gate, exits, keep_rule, keep_model = run_combo_with_discovery(
-        df, entry_df, best_sel, best_exit, train_ids, test_ids
+        paths_df, entry_df, best_sel, best_exit, train_ids, test_ids
     )
     results.to_csv("train_test_gate_validation.csv", index=False)
 
@@ -743,7 +853,7 @@ if __name__ == "__main__":
     print("  Fitted model gate probability threshold:", None if model_gate is None else model_gate["threshold"])
 
     print("\n  --- Notable trades in TEST (identify outliers before trusting an average) ---")
-    best_trades, worst_trades = notable_trades(df, exits, test_ids, keep_rule, keep_model, n=5)
+    best_trades, worst_trades = notable_trades(entry_df, exits, test_ids, keep_rule, keep_model, n=5)
     with pd.option_context("display.max_columns", None, "display.width", 160, "display.max_colwidth", 40):
         print("  Best 5:")
         print(best_trades.to_string(index=False))
