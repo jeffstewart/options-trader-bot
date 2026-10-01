@@ -61,7 +61,9 @@ NEWS_MAX_TICKER_ARTICLES = int(os.environ.get("NEWS_MAX_TICKER_ARTICLES", "10"))
 # Trailing window for macro/market news sentiment flow
 NEWS_MARKET_SENTIMENT_HOURS = int(os.environ.get("NEWS_MARKET_SENTIMENT_HOURS", "24"))
 
-# Polling interval for live news stream
+# ── News Ingestion & Feed Mode ─────────────────────────────────────────────────
+# Modes: 'websocket' (default real-time Alpaca WebSocket push) | 'poll' (REST fallback)
+NEWS_FEED_MODE = os.environ.get("NEWS_FEED_MODE", "websocket").lower()
 NEWS_POLL_SECS = int(os.environ.get("NEWS_POLL_SECS", "15"))
 
 # Startup backfill: fetch past N days of news to ensure bot doesn't start blind
@@ -117,4 +119,34 @@ REGIME_SPY_SMA_DAYS = 200
 REGIME_MOM_DAYS     = 3
 REGIME_DOWNDAY_WINDOW = 10
 REGIME_DOWNDAY_MAX_DENSITY = 0.60
+
+# ── Contract Grid Research Collector ──────────────────────────────────────────
+# Background market-data collector for evaluating contract selection and exit rules
+# across strikes and expiries for both Bullish (Calls) and Bearish (Puts) catalysts.
+GRID_COLLECTOR_ENABLED = os.environ.get("GRID_COLLECTOR_ENABLED", "1") == "1"
+GRID_LOG_THRESHOLD     = float(os.environ.get("GRID_LOG_THRESHOLD", "0.20"))
+GRID_DTE_MIN           = int(os.environ.get("GRID_DTE_MIN", "5"))
+GRID_DTE_MAX           = int(os.environ.get("GRID_DTE_MAX", "35"))
+GRID_STRIKE_LO_MULT    = float(os.environ.get("GRID_STRIKE_LO_MULT", "0.75"))
+GRID_STRIKE_HI_MULT    = float(os.environ.get("GRID_STRIKE_HI_MULT", "1.25"))
+
+# Restrict collection to the remainder of the signal day to prevent multi-gigabyte accumulation
+GRID_TRACK_SAME_DAY_ONLY = os.environ.get("GRID_TRACK_SAME_DAY_ONLY", "1") == "1"
+GRID_MAX_TRACK_MINUTES   = int(os.environ.get("GRID_MAX_TRACK_MINUTES", "390"))  # 6.5 hours (market session)
+GRID_MAX_TRACK_DAYS      = int(os.environ.get("GRID_MAX_TRACK_DAYS", "1"))
+
+# Normalized CSV outputs:
+# - contract_grid_signals.csv: 1 row per signal (headline, scores, regime, stock price at signal)
+# - contract_grid_snapshots.csv: recurring quote + greeks snapshots keyed only by signal_id
+GRID_SIGNALS_CSV       = DATA_DIR / os.environ.get("GRID_SIGNALS_CSV", "contract_grid_signals.csv")
+GRID_SNAPSHOT_CSV      = DATA_DIR / os.environ.get("GRID_SNAPSHOT_CSV", "contract_grid_snapshots.csv")
+
+GRID_POLL_SCHEDULE = [
+    (15,     30),          # 0-15 min: every 30s (immediate reaction)
+    (60,     180),         # 15-60 min: every 3 min (horizon exit window)
+    (390,    900),         # 1-6.5 hrs (rest of signal day): every 15 min
+]
+
+GRID_VOL_PROXY_SYMBOL        = os.environ.get("GRID_VOL_PROXY_SYMBOL", "VIXY")
+GRID_VOL_PROXY_LOOKBACK_DAYS = int(os.environ.get("GRID_VOL_PROXY_LOOKBACK_DAYS", "20"))
 

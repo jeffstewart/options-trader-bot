@@ -44,31 +44,40 @@ JSON Schema:
 }
 
 Definitions:
-- sentiment: "bullish" | "bearish" | "neutral" (we trade long call options, so identify genuine upside catalysts)
+- sentiment: "bullish" | "bearish" | "neutral"
+    "bullish" -> genuine fresh upside catalyst (surprise earnings beat + raised guidance, major contract win, buyout offer, FDA clearance, transformative partnership)
+    "bearish" -> genuine fresh downside catalyst (disastrous earnings miss + slashed guidance, major customer loss / contract cancellation, FDA Complete Response Letter (CRL) / clinical trial failure, SEC / DOJ fraud probe, sudden executive departure under cloud)
+    "neutral" -> mixed, routine, minor, speculation/rumor, or stale recap/echo
 - confidence: float 0.0–1.0 — certainty in the directional sentiment
-- magnitude: float 0.0–1.0 — expected price impact / significance:
+- magnitude: float 0.0–1.0 — expected price impact / significance (always positive magnitude regardless of direction):
     0.0–0.2  Noise, routine update, recap, speculation, or already fully priced in
-    0.2–0.4  Minor/incremental news (modest contract win, routine analyst chatter, sympathy move)
-    0.4–0.6  Meaningful catalyst (unexpected earnings beat with raised guidance, strategic partnership, FDA clearance)
-    0.6–0.8  Strong catalyst (transformative buyout offer, blockbuster drug approval)
+    0.2–0.4  Minor/incremental news (modest contract win or loss, routine analyst chatter/downgrade, sympathy move)
+    0.4–0.6  Meaningful catalyst (unexpected earnings beat/miss with guidance revision, strategic partnership or major contract termination, FDA approval or CRL)
+    0.6–0.8  Strong catalyst (transformative buyout offer, catastrophic fraud investigation, blockbuster drug failure/approval)
     0.8–1.0  Rare paradigm shift (reserved for verified, historic corporate events)
-- is_stale_echo: boolean — true if this article is merely recapping, explaining ("why stock surged"), or echoing news/themes already covered in the prior 1-7 days
+- is_stale_echo: boolean — true if this article is merely recapping, explaining ("why stock surged" / "why stock plunged"), or echoing news/themes already covered in the prior 1-7 days
 
 Strict Decision Rules:
 1. ECHO / RECAP DETECTION:
    - Carefully review the PRIOR NEWS HISTORY for the ticker.
    - If the current article refers to an event, theme, earnings report, clinical data, or product launch that already appeared in the prior 1 to 7 days, IT IS ALREADY DIGESTED BY THE MARKET.
    - YOU MUST set "is_stale_echo": true, "sentiment": "neutral", and "magnitude": <= 0.25.
-   - Example of an Echo:
-     Prior News: "[2026-09-15] Company X reports Q2 earnings beat, stock up 10%"
-     Target Article: "[2026-09-17] Why Company X is rallying today as analysts praise quarter"
-     -> is_stale_echo = true, magnitude = 0.20, sentiment = "neutral".
+   - Examples of an Echo:
+     Bullish Echo:
+       Prior News: "[2026-09-15] Company X reports Q2 earnings beat, stock up 10%"
+       Target Article: "[2026-09-17] Why Company X is rallying today as analysts praise quarter"
+       -> is_stale_echo = true, magnitude = 0.20, sentiment = "neutral".
+     Bearish Echo:
+       Prior News: "[2026-09-15] Company Y reports Q2 earnings miss and slashes guidance"
+       Target Article: "[2026-09-17] Why Company Y shares are tumbling today"
+       -> is_stale_echo = true, magnitude = 0.20, sentiment = "neutral".
 2. RETAIL HYPE & SPECULATION TRAPS:
-   - Rumors ("Traders circulate unconfirmed rumor..."), sympathy moves ("X rises ahead of Tesla event..."), technical chart talk ("Stock breaks major resistance..."), or influencer chatter ("Billionaire criticizes company...") are high-IV retail traps.
+   - Rumors ("Traders circulate unconfirmed rumor..."), sympathy moves ("X moves ahead of competitor event..."), technical chart talk ("Stock breaks major support/resistance..."), or influencer chatter are high-IV retail traps.
    - For all such articles: set "magnitude": <= 0.25 and "sentiment": "neutral".
 3. GENUINE FRESH CATALYSTS:
-   - A genuine catalyst must be a NEW, verified, unannounced fundamental development (e.g. surprise buyout offer, unexpected quarterly earnings blowout with raised guidance, surprise FDA approval) with NO prior coverage in the trailing history.
-   - In that case: "is_stale_echo": false, "sentiment": "bullish", "magnitude": 0.50–0.80.
+   - A genuine catalyst must be a NEW, verified, unannounced fundamental development with NO prior coverage in the trailing history.
+   - If fresh bullish: "is_stale_echo": false, "sentiment": "bullish", "magnitude": 0.50–0.80.
+   - If fresh bearish: "is_stale_echo": false, "sentiment": "bearish", "magnitude": 0.50–0.80.
 4. REASONING:
    - State clearly in one sentence: (1) whether the event is novel or an echo of prior news, and (2) why it does or does not represent a tradeable catalyst."""
 
@@ -149,7 +158,7 @@ Body: {body[:1500] if body else "(No additional body text provided)"}
 • Key Macro / Market Headlines:
 {macro_block}
 
-Evaluate whether the TARGET ARTICLE represents a fresh, actionable catalyst for long calls. Respond with JSON ONLY."""
+Evaluate whether the TARGET ARTICLE represents a fresh, actionable directional catalyst (bullish for calls or bearish for puts). Respond with JSON ONLY."""
 
     return prompt
 
@@ -411,12 +420,12 @@ def correct_ticker(headline: str, body: str, symbols: list[str],
     if len(symbols) == 1:
         return symbols[0]
 
-    prompt = f"""Given this news article and list of candidate ticker symbols, return ONLY the ticker of the primary positive beneficiary.
+    prompt = f"""Given this news article and list of candidate ticker symbols, return ONLY the ticker of the primary corporate entity impacted by this news.
 Article Headline: {headline}
 Summary: {body[:500]}
 Candidate Symbols: {', '.join(symbols)}
 
-Return ONLY the single ticker symbol, or NONE if no single company is the clear beneficiary."""
+Return ONLY the single ticker symbol, or NONE if no single company is the clear subject."""
 
     try:
         client = OpenAI(base_url=cfg.OLLAMA_BASE_URL, api_key="ollama")

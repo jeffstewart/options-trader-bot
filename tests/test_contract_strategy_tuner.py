@@ -206,3 +206,99 @@ def test_notable_trades_defensive():
     assert best.iloc[0]["signal_id"] == "S1"
     assert len(worst) == 1
     assert worst.iloc[0]["signal_id"] == "S2"
+
+
+def test_load_normalized_schema(tmp_path):
+    """Verify loading compact snapshots file merges with contract_grid_signals.csv."""
+    sig_csv = tmp_path / "contract_grid_signals.csv"
+    snap_csv = tmp_path / "contract_grid_snapshots.csv"
+
+    # 1. Write signals metadata
+    sig_df = pd.DataFrame([{
+        "signal_id": "NORM_SIG_1",
+        "signal_ts": "2026-09-29T14:30:00+00:00",
+        "ticker": "AAPL",
+        "headline": "Apple Q4 Beats",
+        "source": "Benzinga",
+        "scorer_model": "llama3.2",
+        "sentiment": "bullish",
+        "magnitude": 0.85,
+        "confidence": 0.90,
+        "catalyst": "Record Services Revenue",
+        "stock_price_at_signal": 225.0,
+        "spy_price": 560.0,
+        "spy_sma": 550.0,
+        "regime_uptrend": True,
+        "regime_mom_ok": True,
+        "regime_chop_ok": True,
+        "regime_dd_density": 0.2,
+        "vol_proxy_symbol": "VIXY",
+        "vol_proxy_price": 14.5,
+        "vol_proxy_pctile": 0.45,
+        "passes_news_call_gate": True,
+        "passes_lotto_gate": False,
+    }])
+    sig_df.to_csv(sig_csv, index=False)
+
+    # 2. Write compact snapshots referencing only signal_id
+    snap_df = pd.DataFrame([
+        {
+            "signal_id": "NORM_SIG_1",
+            "snapshot_ts": "2026-09-29T14:30:05+00:00",
+            "minutes_since_signal": 0.08,
+            "stock_price": 225.0,
+            "symbol": "AAPL261016C00225000",
+            "contract_type": "call",
+            "strike": 225.0,
+            "expiry": "2026-10-16",
+            "dte_at_signal": 17,
+            "oi_at_signal": 2500,
+            "bid": 3.40,
+            "ask": 3.50,
+            "mid": 3.45,
+            "spread_pct": 0.029,
+            "iv": 0.28,
+            "delta": 0.51,
+            "gamma": 0.04,
+            "theta": -0.05,
+            "vega": 0.16,
+            "rho": 0.07,
+        },
+        {
+            "signal_id": "NORM_SIG_1",
+            "snapshot_ts": "2026-09-29T14:30:35+00:00",
+            "minutes_since_signal": 0.58,
+            "stock_price": 225.2,
+            "symbol": "AAPL261016C00225000",
+            "contract_type": "call",
+            "strike": 225.0,
+            "expiry": "2026-10-16",
+            "dte_at_signal": 17,
+            "oi_at_signal": 2500,
+            "bid": 3.50,
+            "ask": 3.60,
+            "mid": 3.55,
+            "spread_pct": 0.028,
+            "iv": 0.28,
+            "delta": 0.52,
+            "gamma": 0.04,
+            "theta": -0.05,
+            "vega": 0.16,
+            "rho": 0.07,
+        }
+    ])
+    snap_df.to_csv(snap_csv, index=False)
+
+    entry_df, total_rows, counts = load_entry_snapshot_and_stats(str(snap_csv))
+    assert total_rows == 2
+    assert len(entry_df) == 1
+    row = entry_df.iloc[0]
+    # Check that signal metadata was merged cleanly from contract_grid_signals.csv:
+    assert row["signal_id"] == "NORM_SIG_1"
+    assert row["ticker"] == "AAPL"
+    assert row["headline"] == "Apple Q4 Beats"
+    assert row["magnitude"] == 0.85
+    assert row["confidence"] == 0.90
+    assert row["catalyst"] == "Record Services Revenue"
+    assert row["delta"] == 0.51
+

@@ -72,6 +72,18 @@ Supports hot-swapping between local and frontier LLMs via environment variables:
 * **`gemini`**: Supports Google Gemini models (`gemini-2.5-flash`, `gemini-1.5-flash`) with automatic pacing ($\le 13$ RPM), exponential backoff, and daily quota safety tracking.
 * **`anthropic` & `moonshot`**: Full support for Claude 3.5 Sonnet and Kimi k2.6.
 
+### D. Real-Time WebSocket Ingestion (`bot.py`)
+Replaces periodic REST polling with Alpaca's push-based `NewsDataStream` (`alpaca.data.live`):
+* **Lower Latency**: Delivers breaking catalysts seconds closer to publication timestamp.
+* **Resilient Connection**: Wrapped with exponential reconnection backoff to protect against tight reconnect loops during provider blips.
+* **Fallback Support**: Seamlessly falls back to periodic REST polling if `NEWS_FEED_MODE="poll"`.
+
+### E. Normalized Contract Grid Telemetry (`grid_collector.py`)
+Migrated and reimagined from legacy v1 to eliminate disk and memory bloat:
+* **Same-Day Bounding**: Polling prunes signals after market close or 390 session minutes ($\le 6.5$h) instead of tracking for 32 days through expiry.
+* **Relational Normalization**: Separates static signal metadata into `contract_grid_signals.csv` (1 row per signal) while storing compact quotes/Greeks in `contract_grid_snapshots.csv` keyed by `signal_id`, reducing data footprint by **>90%**.
+* **Symmetrical Telemetry**: Automatically records Call option grids for bullish news and Put option grids for bearish news. Live trading remains strictly Call-only while this dataset gathers empirical evidence to calibrate future Put purchasing gates.
+
 ---
 
 ## 3. Empirical Research Findings

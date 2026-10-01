@@ -43,6 +43,9 @@ def test_prescore_listicles(headline):
     "Nvidia shares are soaring: what's driving the rally?",
     "Why Apple stock is jumping higher after hours",
     "Palantir shares climbing: here's why",
+    "Why Intel shares are tumbling today",
+    "Boeing stock is plunging: here's why",
+    "Why Pfizer shares are falling after hours",
 ])
 def test_prescore_reactive_recaps(headline):
     """Verify reactive post-move explanations are dropped."""

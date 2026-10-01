@@ -4,9 +4,9 @@ A modular, multi-generation algorithmic trading framework designed to trade brea
 
 ### Architecture Generations
 
-- **`v3/` (Current Flagship)** — Context-aware options trading engine running in Docker on Colima. Features an embedded SQLite news archive providing point-in-time ticker history and market sentiment flow, empirical contract selection (~0.50 Delta ATM calls, $\le 6.5\%$ spread cap, $\ge 10$ OI floor, 30m timed horizon exits), and a pluggable LLM scorer (local Ollama, Google Gemini, Anthropic Claude, Moonshot Kimi). See [`v3/README.md`](v3/README.md).
+- **`v3/` (Current Flagship)** — Context-aware options trading engine running in Docker on Colima. Features real-time Alpaca WebSocket news streaming (`NewsDataStream`), symmetrical LLM directional scoring (bullish Calls and bearish Puts), normalized contract grid telemetry (>90% storage reduction), an embedded SQLite news archive providing point-in-time ticker history and market sentiment flow, empirical contract selection (~0.50 Delta ATM calls, $\le 6.5\%$ spread cap, $\ge 10$ OI floor, 30m timed horizon exits), and a pluggable LLM scorer (local Ollama, Google Gemini, Anthropic Claude, Moonshot Kimi). See [`v3/README.md`](v3/README.md).
 - **`v2/`** — Lean containerized options bot focused on far-OTM lotto experiments. See [`v2/README.md`](v2/README.md).
-- **`core/` (v1)** — The foundational engine that captured the 5-week, 7.5-million-row options order-book research dataset (`contract_grid_snapshots.csv`) used to calibrate v3.
+- **`core/` (v1 - SUNSET)** — The foundational engine that captured the initial 8.26-million-row options order-book research dataset (`contract_grid_snapshots.csv`). Now sunset; its research data collection tap has been moved into v3 with relational normalization.
 
 The entire stack is orchestrated via [`everything.sh`](everything.sh).
 

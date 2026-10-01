@@ -19,11 +19,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
+from alpaca.data.live import NewsDataStream
 
 try:
     from v3 import config as cfg
     from v3 import execution
     from v3 import filters
+    from v3 import grid_collector
     from v3 import market as mkt
     from v3 import news_db
     from v3 import scoring
@@ -31,6 +33,7 @@ except ImportError:
     import config as cfg
     import execution
     import filters
+    import grid_collector
     import market as mkt
     import news_db
     import scoring
@@ -74,29 +77,10 @@ async def process_signal(headline: str, body: str, source: str,
             log.info("🚫 Soft catalyst matched [%s] — skipping: %s", soft, headline[:80])
             return
 
-    # 4. Market regime check (SPY 200d SMA, 3-day momentum, chop brake)
-    regime = mkt.evaluate_regime()
-    if not regime.get("passes_regime", True):
-        log.debug("Regime pause active (uptrend=%s mom=%s chop=%s) — skipping signal",
-                  regime.get("uptrend_ok"), regime.get("mom_ok"), regime.get("chop_ok"))
-        return
-
-    # 5. Circuit breaker check
-    if mkt.check_daily_loss_breaker():
-        log.warning("Daily loss breaker active — skipping trade for %s", headline[:80])
-        return
-
-    # 6. Candidate ticker resolution
+    # 4. Candidate ticker resolution
     candidate_ticker = symbols[0] if symbols else ""
-    if candidate_ticker:
-        # Cooldown check
-        last_traded = _recent_trades.get(candidate_ticker, 0.0)
-        if time.time() - last_traded < cfg.COOLDOWN_SECS:
-            log.debug("Cooldown active for %s (%.0fs remaining) — skipping",
-                      candidate_ticker, cfg.COOLDOWN_SECS - (time.time() - last_traded))
-            return
 
-    # 7. Context-Aware LLM Scoring
+    # 5. Context-Aware LLM Scoring
     score = scoring.score_article(
         headline=headline,
         body=body,
@@ -119,27 +103,7 @@ async def process_signal(headline: str, body: str, source: str,
             reasoning=score.get("reasoning", ""),
         )
 
-    # 8. Signal threshold checks
-    sentiment = score.get("sentiment", "neutral")
-    confidence = score.get("confidence", 0.0)
-    magnitude = score.get("magnitude", 0.0)
-    is_echo = score.get("is_stale_echo", False)
-
-    if sentiment != "bullish":
-        log.debug("Non-bullish sentiment (%s) — skipping", sentiment)
-        return
-
-    if is_echo:
-        log.info("🔁 Stale echo/recap detected by LLM context — skipping %s: %s",
-                 candidate_ticker, headline[:80])
-        return
-
-    if confidence < cfg.MIN_CONFIDENCE or magnitude < cfg.MIN_MAGNITUDE:
-        log.info("Signal below threshold (mag=%.2f/%.2f, conf=%.2f/%.2f) — skipping %s",
-                 magnitude, cfg.MIN_MAGNITUDE, confidence, cfg.MIN_CONFIDENCE, candidate_ticker)
-        return
-
-    # 9. Ticker resolution and correction
+    # 6. Ticker resolution and correction
     model_tickers = score.get("tickers", [])
     primary_ticker = candidate_ticker or (model_tickers[0] if model_tickers else "")
     if len(symbols) > 1:
@@ -151,6 +115,61 @@ async def process_signal(headline: str, body: str, source: str,
         log.info("No definitive ticker identified — skipping signal")
         return
 
+    # 7. Contract Grid Research Telemetry Hook
+    # Collects quotes & Greeks for both Bullish (Calls) and Bearish (Puts) without placing orders
+    if grid_collector.should_collect(score):
+        signal_id = grid_collector.make_signal_id(primary_ticker, ts)
+        asyncio.create_task(
+            grid_collector.start_collection(
+                signal_id=signal_id,
+                signal_ts=ts,
+                ticker=primary_ticker,
+                signal=score,
+                headline=headline,
+                source=source,
+                get_stock_price=mkt.get_stock_price,
+            )
+        )
+
+    # 8. Live Trading Execution Gates (Call-only for now; Put trading gated pending research telemetry)
+    sentiment = (score.get("sentiment") or "neutral").lower()
+    confidence = float(score.get("confidence", 0.0))
+    magnitude = float(score.get("magnitude", 0.0))
+    is_echo = bool(score.get("is_stale_echo", False))
+
+    if sentiment != "bullish":
+        log.debug("Non-bullish sentiment (%s) — skipping live trade", sentiment)
+        return
+
+    if is_echo:
+        log.info("🔁 Stale echo/recap detected by LLM context — skipping %s: %s",
+                 primary_ticker, headline[:80])
+        return
+
+    if confidence < cfg.MIN_CONFIDENCE or magnitude < cfg.MIN_MAGNITUDE:
+        log.info("Signal below threshold (mag=%.2f/%.2f, conf=%.2f/%.2f) — skipping %s",
+                 magnitude, cfg.MIN_MAGNITUDE, confidence, cfg.MIN_CONFIDENCE, primary_ticker)
+        return
+
+    # Cooldown check
+    last_traded = _recent_trades.get(primary_ticker, 0.0)
+    if time.time() - last_traded < cfg.COOLDOWN_SECS:
+        log.debug("Cooldown active for %s (%.0fs remaining) — skipping live trade",
+                  primary_ticker, cfg.COOLDOWN_SECS - (time.time() - last_traded))
+        return
+
+    # Market regime check (SPY 200d SMA, 3-day momentum, chop brake)
+    regime = mkt.evaluate_regime()
+    if not regime.get("passes_regime", True):
+        log.debug("Regime pause active (uptrend=%s mom=%s chop=%s) — skipping live trade",
+                  regime.get("uptrend_ok"), regime.get("mom_ok"), regime.get("chop_ok"))
+        return
+
+    # Circuit breaker check
+    if mkt.check_daily_loss_breaker():
+        log.warning("Daily loss breaker active — skipping live trade for %s", primary_ticker)
+        return
+
     # Stock price check
     stock_price = mkt.get_stock_price(primary_ticker)
     if not stock_price or stock_price < cfg.MIN_STOCK_PRICE:
@@ -158,14 +177,14 @@ async def process_signal(headline: str, body: str, source: str,
                  stock_price or 0.0, cfg.MIN_STOCK_PRICE, primary_ticker)
         return
 
-    # 10. Position Sizing
+    # 9. Position Sizing
     equity = mkt.get_account_equity()
     position_usd = round(equity * cfg.POSITION_FRAC_OF_EQUITY, 2)
 
     log.info("⚡ QUALIFIED SIGNAL: %s (mag=%.2f conf=%.2f) price=$%.2f budget=$%.2f",
              primary_ticker, magnitude, confidence, stock_price, position_usd)
 
-    # 11. Contract Selection & Order Execution
+    # 10. Contract Selection & Order Execution
     signal_meta = {
         "id": news_id,
         "ticker": primary_ticker,
@@ -247,6 +266,96 @@ async def news_poller():
             await asyncio.sleep(cfg.NEWS_POLL_SECS)
 
 
+def _patch_reconnect_safety(stream, name: str = "news"):
+    """
+    Wrap stream._start_ws with exponential backoff on reconnection
+    to prevent tight reconnect loops during Alpaca websocket outages.
+    """
+    orig_start = stream._start_ws
+    backoff = 1.0
+
+    async def _safe_start_ws():
+        nonlocal backoff
+        try:
+            await orig_start()
+            backoff = 1.0
+        except Exception as e:
+            sleep_time = min(backoff, 30.0)
+            log.warning("WebSocket [%s] connection failed: %s. Backing off %.1fs...", name, e, sleep_time)
+            await asyncio.sleep(sleep_time)
+            backoff = min(backoff * 2, 30.0)
+            raise
+
+    stream._start_ws = _safe_start_ws
+
+
+async def handle_news_message(news_item):
+    """Callback for Alpaca NewsDataStream WebSocket messages."""
+    try:
+        if hasattr(news_item, "model_dump"):
+            item = news_item.model_dump()
+        elif hasattr(news_item, "dict"):
+            item = news_item.dict()
+        elif isinstance(news_item, dict):
+            item = news_item
+        else:
+            item = {
+                "id": getattr(news_item, "id", None),
+                "headline": getattr(news_item, "headline", ""),
+                "summary": getattr(news_item, "summary", ""),
+                "symbols": getattr(news_item, "symbols", []),
+                "source": getattr(news_item, "source", "Alpaca/Benzinga"),
+                "url": getattr(news_item, "url", ""),
+                "created_at": getattr(news_item, "created_at", None),
+                "updated_at": getattr(news_item, "updated_at", None),
+            }
+
+        news_id = str(item.get("id") or "")
+        if news_id and news_id in _seen_news_ids:
+            return
+        if news_id:
+            _seen_news_ids.add(news_id)
+
+        # Store article immediately in SQLite archive
+        news_db.store_article(item)
+
+        headline = (item.get("headline") or "").strip()
+        body = (item.get("summary") or "").strip()
+        symbols = item.get("symbols") or []
+        raw_ts = item.get("created_at") or item.get("updated_at")
+        article_ts = None
+        if isinstance(raw_ts, datetime):
+            article_ts = raw_ts.astimezone(timezone.utc)
+        elif isinstance(raw_ts, str):
+            try:
+                article_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        log.info("⚡ [WebSocket News] %s (%s)", headline[:90], ", ".join(symbols[:3]) if symbols else "Macro")
+        asyncio.create_task(
+            process_signal(headline, body, item.get("source") or "Alpaca/Benzinga", symbols, article_ts, news_id)
+        )
+    except Exception as e:
+        log.warning("Error processing websocket news item: %s", e)
+
+
+async def news_stream_listener():
+    """Stream real-time news via Alpaca NewsDataStream."""
+    log.info("Starting Alpaca News WebSocket stream (NewsDataStream)...")
+    while _running:
+        try:
+            stream = NewsDataStream(cfg.ALPACA_KEY, cfg.ALPACA_SECRET)
+            _patch_reconnect_safety(stream, "news")
+            stream.subscribe_news(handle_news_message, "*")
+            await stream._run_forever()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("WebSocket stream exception: %s — restarting in 5s...", e)
+            await asyncio.sleep(5)
+
+
 async def position_monitor_loop():
     """Periodically evaluate open positions for timed horizon exits."""
     log.info("Starting position monitor (horizon exit = %d min) ...", cfg.EXIT_HORIZON_MINUTES)
@@ -270,11 +379,14 @@ def handle_shutdown(signum, frame):
 async def main():
     log.info("=" * 60)
     log.info("TRADER BOT v3 STARTING")
+    log.info("News Ingestion Mode: %s", cfg.NEWS_FEED_MODE)
     log.info("Scorer Provider: %s | Model: %s", cfg.SCORER_PROVIDER, cfg.SCORER_MODEL)
     log.info("News Lookback Window: %d days | Max Ticker Articles: %d",
              cfg.NEWS_LOOKBACK_DAYS, cfg.NEWS_MAX_TICKER_ARTICLES)
     log.info("Execution Geometry: Delta=%.2f | Max Spread=%.1f%% | Min OI=%d | Horizon=%dm",
              cfg.TARGET_DELTA, cfg.MAX_SPREAD_PCT * 100, cfg.MIN_OPEN_INTEREST, cfg.EXIT_HORIZON_MINUTES)
+    log.info("Grid Research Collector: Enabled=%s | Threshold=%.2f | SameDayOnly=%s",
+             cfg.GRID_COLLECTOR_ENABLED, cfg.GRID_LOG_THRESHOLD, cfg.GRID_TRACK_SAME_DAY_ONLY)
     log.info("=" * 60)
 
     # 1. Initialize SQLite news database
@@ -299,10 +411,18 @@ async def main():
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    await asyncio.gather(
-        news_poller(),
+    tasks = [
         position_monitor_loop(),
-    )
+        grid_collector.run_poll_loop(mkt.is_market_open),
+    ]
+
+    feed_mode = getattr(cfg, "NEWS_FEED_MODE", "websocket").lower()
+    if feed_mode == "websocket":
+        tasks.append(news_stream_listener())
+    else:
+        tasks.append(news_poller())
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

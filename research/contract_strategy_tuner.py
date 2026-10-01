@@ -57,6 +57,7 @@ Usage:
 import sys
 from collections import Counter
 from itertools import product
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
@@ -114,6 +115,57 @@ def load_entry_snapshot_and_stats(path: str, chunksize: int = 500_000) -> tuple[
     # Downcast float64 to float32 to minimize memory footprint
     for col in entry_df.select_dtypes(include=["float64"]).columns:
         entry_df[col] = entry_df[col].astype("float32")
+
+    # Merge normalized signal metadata if stored separately in contract_grid_signals.csv
+    signals_file = Path(path).parent / "contract_grid_signals.csv"
+    if not signals_file.exists():
+        alt = Path("data/contract_grid_signals.csv")
+        if alt.exists():
+            signals_file = alt
+        else:
+            alt3 = Path("v3/data/contract_grid_signals.csv")
+            if alt3.exists():
+                signals_file = alt3
+
+    if signals_file.exists():
+        try:
+            sig_df = pd.read_csv(signals_file)
+            if "signal_ts" in sig_df.columns:
+                sig_df["signal_ts"] = pd.to_datetime(sig_df["signal_ts"])
+            for c in sig_df.select_dtypes(include=["float64"]).columns:
+                sig_df[c] = sig_df[c].astype("float32")
+            missing_cols = [c for c in sig_df.columns if c not in entry_df.columns or c == "signal_id"]
+            if len(missing_cols) > 1:
+                entry_df = entry_df.merge(sig_df[missing_cols], on="signal_id", how="left")
+                print(f"  Merged signal metadata for {len(sig_df):,} signals from {signals_file}")
+        except Exception as e:
+            print(f"  Note: Failed to load signals from {signals_file}: {e}")
+
+    # Merge v3 context-aware scores if available
+    v3_scores_file = Path("data/v3_rescored_signals.csv")
+    if not v3_scores_file.exists():
+        alt = Path(path).parent / "v3_rescored_signals.csv"
+        if alt.exists():
+            v3_scores_file = alt
+
+    if v3_scores_file.exists():
+        try:
+            v3_df = pd.read_csv(v3_scores_file)
+            v3_cols = ["signal_id", "v3_confidence", "v3_magnitude", "v3_is_stale_echo", "v3_sentiment"]
+            v3_cols = [c for c in v3_cols if c in v3_df.columns]
+            sub_v3 = v3_df[v3_cols].copy()
+            if "v3_is_stale_echo" in sub_v3.columns:
+                sub_v3["v3_is_stale_echo"] = sub_v3["v3_is_stale_echo"].astype(int)
+            if "v3_sentiment" in sub_v3.columns:
+                sub_v3["v3_is_bullish"] = (sub_v3["v3_sentiment"] == "bullish").astype(int)
+                sub_v3 = sub_v3.drop(columns=["v3_sentiment"])
+            for c in ["v3_confidence", "v3_magnitude"]:
+                if c in sub_v3.columns:
+                    sub_v3[c] = sub_v3[c].astype("float32")
+            entry_df = entry_df.merge(sub_v3, on="signal_id", how="left")
+            print(f"  Enriched with {len(sub_v3):,} v3 context-aware scores from {v3_scores_file}")
+        except Exception as e:
+            print(f"  Note: Failed to load v3 scores from {v3_scores_file}: {e}")
 
     rows_per_signal = pd.Series(signal_counts)
     return entry_df, total_rows, rows_per_signal
@@ -182,11 +234,10 @@ def entry_snapshot(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_signal_meta(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby("signal_id")[["signal_ts", "ticker", "magnitude", "confidence",
-                                  "catalyst", "passes_lotto_gate", "regime_mom_ok"]]
-        .first()
-    )
+    meta_cols = ["signal_ts", "ticker", "magnitude", "confidence",
+                 "catalyst", "passes_lotto_gate", "regime_mom_ok"]
+    available = [c for c in meta_cols if c in df.columns]
+    return df.groupby("signal_id")[available].first()
 
 
 # ----------------------------------------------------------------------------
@@ -230,7 +281,7 @@ def walk_forward_splits(signal_meta: pd.DataFrame, n_splits: int = 5, min_train_
 def select_by_delta_target(entry_df, target_delta, min_oi=0, max_spread_pct=999):
     d = entry_df[(entry_df["oi_at_signal"].fillna(0) >= min_oi) &
                  (entry_df["spread_pct"] <= max_spread_pct)].dropna(subset=["delta"]).copy()
-    d["delta_dist"] = (d["delta"] - target_delta).abs()
+    d["delta_dist"] = (d["delta"].abs() - target_delta).abs()
     return d.loc[d.groupby("signal_id")["delta_dist"].idxmin()].set_index("signal_id")["symbol"]
 
 
@@ -373,14 +424,19 @@ def simulate(paths: pd.DataFrame, exit_name: str) -> pd.DataFrame:
 # output range, and a real relationship can easily look flat within a narrow,
 # already-filtered band (restriction of range). That's a data-collection
 # limitation, not evidence the scores don't matter.
-ALWAYS_CONSIDERED_FOR_GATE = ["magnitude", "confidence", "catalyst"]
+ALWAYS_CONSIDERED_FOR_GATE = [
+    "magnitude", "confidence", "catalyst",
+    "v3_magnitude", "v3_confidence", "v3_is_stale_echo", "v3_is_bullish"
+]
 
 NON_FEATURE_COLS = {
     "signal_id", "signal_ts", "ticker", "headline", "source", "scorer_model",
+    "sentiment", "contract_type",
     "snapshot_ts", "symbol", "expiry", "minutes_since_signal", "row_in_group",
     "group_size", "entry_price", "bid_peak", "drawdown_from_peak", "ret_from_entry",
     "stock_price",  # duplicate of stock_price_at_signal at the entry row
     "passes_news_call_gate",  # constant True by construction in this data (already gates entry into the file)
+    "v3_reasoning", "score_duration_sec",  # engineering / explanatory fields
 }
 
 
