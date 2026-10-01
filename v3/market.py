@@ -175,7 +175,8 @@ def evaluate_regime() -> dict:
             start=start_dt,
             limit=250,
         )
-        bars = stock_data_client.get_stock_bars(req).get("SPY", [])
+        resp = stock_data_client.get_stock_bars(req)
+        bars = resp.data.get("SPY", []) if hasattr(resp, "data") and isinstance(resp.data, dict) else (resp.get("SPY", []) if hasattr(resp, "get") else resp["SPY"])
         if len(bars) < 200:
             log.warning("Insufficient SPY bars (%d) for 200d SMA regime evaluation.", len(bars))
             return {"passes_regime": True, "uptrend_ok": True, "mom_ok": True, "chop_ok": True}

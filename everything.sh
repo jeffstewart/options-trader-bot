@@ -97,7 +97,7 @@ case "$1" in
     start_ollama                                    # bots' ticker-corrector calls this — bring it up first
     # [SUNSET] v1 bot+dashboard disabled in favor of v3
     # $ROOT/manage.sh start >/dev/null && echo "  v1 (bot+dashboard): started"
-    ( cd $ROOT/v3 && docker compose up -d >/dev/null ) && echo "  v3-bot (docker): started"
+    ( cd $ROOT/v3 && docker compose up -d --build >/dev/null ) && echo "  v3-bot (docker): started"
     sleep 2
     echo
     status_all ;;
