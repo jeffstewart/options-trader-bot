@@ -73,6 +73,15 @@ BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "7"))
 # Stale news threshold: ignore real-time articles older than this before scoring
 MAX_FEED_LAG_SECS = int(os.environ.get("MAX_FEED_LAG_SECS", "300"))
 
+# ── SEC EDGAR 8-K Feed ─────────────────────────────────────────────────────────
+SEC_FEED_ENABLED = os.environ.get("SEC_FEED_ENABLED", "1") == "1"
+SEC_RSS_URL = os.environ.get(
+    "SEC_RSS_URL",
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&CIK=&type=8-K&company=&dateb=&owner=include&start=0&count=40&output=atom",
+)
+SEC_POLL_SECS = int(os.environ.get("SEC_POLL_SECS", "5"))
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "OptionsTraderBot/3.0 research@optionstrader.local")
+
 # ── Signal & Entry Thresholds ──────────────────────────────────────────────────
 MIN_MAGNITUDE  = float(os.environ.get("MIN_MAGNITUDE", "0.35"))
 MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.70"))

@@ -39,6 +39,7 @@ JSON Schema:
   "sentiment": "bullish",
   "confidence": 0.85,
   "magnitude": 0.75,
+  "catalyst": "earnings",
   "reasoning": "Direct comparison to prior news and assessment of catalyst freshness",
   "is_stale_echo": false
 }
@@ -55,6 +56,17 @@ Definitions:
     0.4–0.6  Meaningful catalyst (unexpected earnings beat/miss with guidance revision, strategic partnership or major contract termination, FDA approval or CRL)
     0.6–0.8  Strong catalyst (transformative buyout offer, catastrophic fraud investigation, blockbuster drug failure/approval)
     0.8–1.0  Rare paradigm shift (reserved for verified, historic corporate events)
+- catalyst: string — the primary catalyst category:
+    "earnings"   -> quarterly earnings report, revenue/sales surprise, financial results
+    "guidance"   -> raised or lowered forward earnings/sales outlook
+    "buyout"     -> M&A, takeover offer, acquisition agreement, buyout revision
+    "fda"        -> FDA approval, rejection/CRL, priority review, clinical trial phase readout
+    "contract"   -> major commercial contract win, strategic partnership, defense/government award
+    "legal"      -> SEC/DOJ probe, fraud investigation, major lawsuit, regulatory penalty
+    "offering"   -> secondary share offering, debt issuance, private placement
+    "management" -> CEO/CFO departure, activist investor board shakeup
+    "recap"      -> retrospective market commentary, listicle, or echo of past event
+    "other"      -> miscellaneous or unclassified event
 - is_stale_echo: boolean — true if this article is merely recapping, explaining ("why stock surged" / "why stock plunged"), or echoing news/themes already covered in the prior 1-7 days
 
 Strict Decision Rules:
@@ -188,6 +200,7 @@ def _clean_json_response(raw: str) -> dict:
     data["sentiment"] = str(data.get("sentiment", "neutral")).lower()
     data["confidence"] = float(data.get("confidence", 0.0))
     data["magnitude"] = float(data.get("magnitude", 0.0))
+    data["catalyst"] = str(data.get("catalyst", "other")).lower().strip()
     data["reasoning"] = str(data.get("reasoning", ""))
     data["is_stale_echo"] = bool(data.get("is_stale_echo", False))
     return data

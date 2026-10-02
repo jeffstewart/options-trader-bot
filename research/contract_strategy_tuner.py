@@ -235,7 +235,8 @@ def entry_snapshot(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_signal_meta(df: pd.DataFrame) -> pd.DataFrame:
     meta_cols = ["signal_ts", "ticker", "magnitude", "confidence",
-                 "catalyst", "passes_lotto_gate", "regime_mom_ok"]
+                 "catalyst", "passes_lotto_gate", "regime_mom_ok",
+                 "contract_type", "sentiment", "is_stale_echo"]
     available = [c for c in meta_cols if c in df.columns]
     return df.groupby("signal_id")[available].first()
 
@@ -288,7 +289,15 @@ def select_by_delta_target(entry_df, target_delta, min_oi=0, max_spread_pct=999)
 def select_by_otm_pct(entry_df, target_otm_pct, min_oi=0, max_spread_pct=999):
     d = entry_df[(entry_df["oi_at_signal"].fillna(0) >= min_oi) &
                  (entry_df["spread_pct"] <= max_spread_pct)].copy()
-    d["otm_pct"] = d["strike"] / d["stock_price_at_signal"] - 1.0
+    if "contract_type" in d.columns:
+        is_put = d["contract_type"].astype(str).str.lower() == "put"
+        d["otm_pct"] = np.where(
+            is_put,
+            (d["stock_price_at_signal"] - d["strike"]) / d["stock_price_at_signal"],
+            (d["strike"] - d["stock_price_at_signal"]) / d["stock_price_at_signal"]
+        )
+    else:
+        d["otm_pct"] = d["strike"] / d["stock_price_at_signal"] - 1.0
     d["otm_dist"] = (d["otm_pct"] - target_otm_pct).abs()
     return d.loc[d.groupby("signal_id")["otm_dist"].idxmin()].set_index("signal_id")["symbol"]
 
@@ -426,12 +435,15 @@ def simulate(paths: pd.DataFrame, exit_name: str) -> pd.DataFrame:
 # limitation, not evidence the scores don't matter.
 ALWAYS_CONSIDERED_FOR_GATE = [
     "magnitude", "confidence", "catalyst",
+    "is_stale_echo", "is_bullish", "is_bearish",
+    "is_sec_source", "catalyst_earnings", "catalyst_fda", "catalyst_buyout",
+    "atm_iv", "iv_hv_ratio", "micro_vol_surge", "micro_price_mom_1m",
     "v3_magnitude", "v3_confidence", "v3_is_stale_echo", "v3_is_bullish"
 ]
 
 NON_FEATURE_COLS = {
     "signal_id", "signal_ts", "ticker", "headline", "source", "scorer_model",
-    "sentiment", "contract_type",
+    "sentiment", "contract_type", "reasoning",
     "snapshot_ts", "symbol", "expiry", "minutes_since_signal", "row_in_group",
     "group_size", "entry_price", "bid_peak", "drawdown_from_peak", "ret_from_entry",
     "stock_price",  # duplicate of stock_price_at_signal at the entry row
@@ -446,12 +458,37 @@ def build_broad_feature_table(entry_df: pd.DataFrame, picked: pd.Series):
     Zero-variance columns are dropped automatically (they can't predict anything
     and would just add noise to the significance tests)."""
     picked_df = picked.reset_index()  # signal_id, symbol
+    if "index" in picked_df.columns and "signal_id" not in picked_df.columns:
+        picked_df = picked_df.rename(columns={"index": "signal_id"})
+    if 0 in picked_df.columns and "symbol" not in picked_df.columns:
+        picked_df = picked_df.rename(columns={0: "symbol"})
     d = picked_df.merge(entry_df, on=["signal_id", "symbol"], how="left").set_index("signal_id")
 
     # standard, non-arbitrary derived ratios (not "features I think matter" -
     # just putting raw prices on a comparable scale across different contracts)
-    d["otm_pct"] = d["strike"] / d["stock_price_at_signal"] - 1.0
+    if "contract_type" in d.columns:
+        is_put = d["contract_type"].astype(str).str.lower() == "put"
+        d["otm_pct"] = np.where(
+            is_put,
+            (d["stock_price_at_signal"] - d["strike"]) / d["stock_price_at_signal"],
+            (d["strike"] - d["stock_price_at_signal"]) / d["stock_price_at_signal"]
+        )
+    else:
+        d["otm_pct"] = d["strike"] / d["stock_price_at_signal"] - 1.0
     d["spy_trend"] = d["spy_price"] / d["spy_sma"] - 1.0
+
+    if "sentiment" in d.columns:
+        d["is_bullish"] = (d["sentiment"].astype(str).str.lower() == "bullish").astype(int)
+        d["is_bearish"] = (d["sentiment"].astype(str).str.lower() == "bearish").astype(int)
+
+    if "source" in d.columns:
+        d["is_sec_source"] = (d["source"].astype(str).str.upper() == "SEC").astype(int)
+
+    if "catalyst" in d.columns:
+        if not pd.api.types.is_numeric_dtype(d["catalyst"]):
+            cats = ["earnings", "fda", "buyout", "guidance", "contract", "legal", "offering", "management"]
+            for cat in cats:
+                d[f"catalyst_{cat}"] = (d["catalyst"].astype(str).str.lower() == cat).astype(int)
 
     candidate_cols = [c for c in d.columns if c not in NON_FEATURE_COLS]
     feats = pd.DataFrame(index=d.index)
@@ -822,13 +859,27 @@ def notable_trades(df: pd.DataFrame, exits: pd.DataFrame, ids, keep_rule: pd.Ser
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "contract_grid_snapshots.csv"
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate and tune contract selection and gates.")
+    parser.add_argument("path", nargs="?", default="contract_grid_snapshots.csv", help="Path to contract_grid_snapshots.csv")
+    parser.add_argument("--contract-type", choices=["all", "call", "put"], default="all",
+                        help="Filter to 'call' only, 'put' only, or 'all' contracts (default: all)")
+    parser.add_argument("--test-frac", type=float, default=0.3,
+                        help="Fraction of signals for out-of-sample test split (default: 0.3)")
+    args = parser.parse_args()
+
+    path = args.path
     print(f"Loading {path} (Pass 1: entry snapshots and dataset diagnostics) ...")
     entry_df, total_rows, rows_per_signal = load_entry_snapshot_and_stats(path)
+
+    if args.contract_type != "all" and "contract_type" in entry_df.columns:
+        print(f"Filtering to contract_type == '{args.contract_type}' ...")
+        entry_df = entry_df[entry_df["contract_type"].astype(str).str.lower() == args.contract_type].copy()
+
     signal_meta = get_signal_meta(entry_df)
     print(f"Loaded {total_rows:,} total rows across {len(signal_meta)} signals, {entry_df['ticker'].nunique()} tickers.")
 
-    train_ids, test_ids = chronological_split(signal_meta, test_frac=0.3)
+    train_ids, test_ids = chronological_split(signal_meta, test_frac=args.test_frac)
     print(f"Chronological split: {len(train_ids)} train signals, {len(test_ids)} test signals.")
 
     # --- Coverage diagnostics: is the data what you think it is? ---

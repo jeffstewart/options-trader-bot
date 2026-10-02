@@ -302,3 +302,93 @@ def test_load_normalized_schema(tmp_path):
     assert row["catalyst"] == "Record Services Revenue"
     assert row["delta"] == 0.51
 
+
+def test_put_option_selection():
+    """Verify that OTM selection for put options selects strikes below the stock price."""
+    from research.contract_strategy_tuner import select_by_otm_pct, select_by_delta_target
+
+    entry_df = pd.DataFrame([
+        # Call options on AAPL at $100
+        {"signal_id": "SIG_CALL", "symbol": "AAPL_C105", "contract_type": "call", "stock_price_at_signal": 100.0,
+         "strike": 105.0, "oi_at_signal": 100, "spread_pct": 0.05, "delta": 0.45},
+        {"signal_id": "SIG_CALL", "symbol": "AAPL_C110", "contract_type": "call", "stock_price_at_signal": 100.0,
+         "strike": 110.0, "oi_at_signal": 100, "spread_pct": 0.05, "delta": 0.30},
+
+        # Put options on TSLA at $200: $190 strike is 5% OTM, $180 strike is 10% OTM
+        {"signal_id": "SIG_PUT", "symbol": "TSLA_P190", "contract_type": "put", "stock_price_at_signal": 200.0,
+         "strike": 190.0, "oi_at_signal": 100, "spread_pct": 0.05, "delta": -0.45},
+        {"signal_id": "SIG_PUT", "symbol": "TSLA_P180", "contract_type": "put", "stock_price_at_signal": 200.0,
+         "strike": 180.0, "oi_at_signal": 100, "spread_pct": 0.05, "delta": -0.30},
+    ])
+
+    picked_otm5 = select_by_otm_pct(entry_df, 0.05)
+    assert picked_otm5["SIG_CALL"] == "AAPL_C105"
+    # For put: 5% OTM on $200 stock is strike $190:
+    assert picked_otm5["SIG_PUT"] == "TSLA_P190"
+
+    picked_otm10 = select_by_otm_pct(entry_df, 0.10)
+    assert picked_otm10["SIG_CALL"] == "AAPL_C110"
+    assert picked_otm10["SIG_PUT"] == "TSLA_P180"
+
+    picked_delta = select_by_delta_target(entry_df, 0.45)
+    assert picked_delta["SIG_CALL"] == "AAPL_C105"
+    assert picked_delta["SIG_PUT"] == "TSLA_P190"
+
+
+def test_is_stale_echo_in_feature_table():
+    """Verify is_stale_echo is retained in broad feature table and ALWAYS_CONSIDERED_FOR_GATE."""
+    from research.contract_strategy_tuner import build_broad_feature_table, ALWAYS_CONSIDERED_FOR_GATE
+
+    assert "is_stale_echo" in ALWAYS_CONSIDERED_FOR_GATE
+
+    entry_df = pd.DataFrame([
+        {"signal_id": "SIG_1", "symbol": "AAPL_C100", "contract_type": "call", "stock_price_at_signal": 100.0,
+         "strike": 100.0, "oi_at_signal": 50, "spread_pct": 0.04, "delta": 0.50, "spy_price": 500.0, "spy_sma": 490.0,
+         "magnitude": 0.8, "confidence": 0.9, "is_stale_echo": True, "sentiment": "bullish"},
+        {"signal_id": "SIG_2", "symbol": "MSFT_C200", "contract_type": "call", "stock_price_at_signal": 200.0,
+         "strike": 200.0, "oi_at_signal": 50, "spread_pct": 0.04, "delta": 0.50, "spy_price": 500.0, "spy_sma": 490.0,
+         "magnitude": 0.5, "confidence": 0.7, "is_stale_echo": False, "sentiment": "bullish"},
+    ])
+    picked = pd.Series(["AAPL_C100", "MSFT_C200"], index=["SIG_1", "SIG_2"])
+    feats, dropped = build_broad_feature_table(entry_df, picked)
+
+    assert "is_stale_echo" in feats.columns
+    assert feats.loc["SIG_1", "is_stale_echo"] == 1
+    assert feats.loc["SIG_2", "is_stale_echo"] == 0
+
+
+def test_catalyst_and_sec_source_features():
+    """Verify catalyst categories, is_sec_source, and IV features in tuner."""
+    from research.contract_strategy_tuner import build_broad_feature_table, ALWAYS_CONSIDERED_FOR_GATE
+
+    assert "is_sec_source" in ALWAYS_CONSIDERED_FOR_GATE
+    assert "catalyst_earnings" in ALWAYS_CONSIDERED_FOR_GATE
+    assert "catalyst_buyout" in ALWAYS_CONSIDERED_FOR_GATE
+
+    entry_df = pd.DataFrame([
+        {"signal_id": "SIG_1", "symbol": "AAPL_C100", "contract_type": "call", "stock_price_at_signal": 100.0,
+         "strike": 100.0, "oi_at_signal": 50, "spread_pct": 0.04, "delta": 0.50, "spy_price": 500.0, "spy_sma": 490.0,
+         "magnitude": 0.8, "confidence": 0.9, "catalyst": "earnings", "source": "SEC", "atm_iv": 0.35},
+        {"signal_id": "SIG_2", "symbol": "MSFT_C200", "contract_type": "call", "stock_price_at_signal": 200.0,
+         "strike": 200.0, "oi_at_signal": 50, "spread_pct": 0.04, "delta": 0.50, "spy_price": 500.0, "spy_sma": 490.0,
+         "magnitude": 0.5, "confidence": 0.7, "catalyst": "buyout", "source": "Alpaca", "atm_iv": 0.25},
+    ])
+    picked = pd.Series(["AAPL_C100", "MSFT_C200"], index=["SIG_1", "SIG_2"])
+    feats, dropped = build_broad_feature_table(entry_df, picked)
+
+    assert "catalyst_earnings" in feats.columns
+    assert feats.loc["SIG_1", "catalyst_earnings"] == 1
+    assert feats.loc["SIG_2", "catalyst_earnings"] == 0
+
+    assert "catalyst_buyout" in feats.columns
+    assert feats.loc["SIG_1", "catalyst_buyout"] == 0
+    assert feats.loc["SIG_2", "catalyst_buyout"] == 1
+
+    assert "is_sec_source" in feats.columns
+    assert feats.loc["SIG_1", "is_sec_source"] == 1
+    assert feats.loc["SIG_2", "is_sec_source"] == 0
+
+    assert "atm_iv" in feats.columns
+    assert feats.loc["SIG_1", "atm_iv"] == 0.35
+
+

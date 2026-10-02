@@ -55,6 +55,9 @@ _SIGNAL_HEADER = [
     "spy_price", "spy_sma", "regime_uptrend", "regime_mom_ok", "regime_chop_ok", "regime_dd_density",
     "vol_proxy_symbol", "vol_proxy_price", "vol_proxy_pctile",
     "passes_news_call_gate", "passes_lotto_gate",
+    "is_stale_echo", "reasoning",
+    "atm_iv", "ticker_hv_30", "iv_hv_ratio",
+    "micro_vol_surge", "micro_price_mom_1m", "micro_price_mom_5m", "micro_tick_dir",
 ]
 
 # Recurring snapshots: compact quote & Greeks time series referencing signal_id
@@ -98,11 +101,20 @@ def _write_signal_row(signal_id: str, state: dict) -> None:
         row = [
             signal_id, state["signal_ts"].isoformat(), state["ticker"], state["headline"],
             state["source"], state["scorer_model"], state.get("sentiment", ""),
-            state["magnitude"], state["confidence"], state["catalyst"], state["stock_price_at_signal"],
+            state["magnitude"], state["confidence"], state.get("catalyst", ""), state["stock_price_at_signal"],
             state["spy_price"], state["spy_sma"], state["regime_uptrend"], state["regime_mom_ok"],
             state["regime_chop_ok"], state["regime_dd_density"], state["vol_proxy_symbol"],
             state["vol_proxy_price"], state["vol_proxy_pctile"], state["passes_news_call_gate"],
             state["passes_lotto_gate"],
+            state.get("is_stale_echo", False),
+            state.get("reasoning", ""),
+            state.get("atm_iv", ""),
+            state.get("ticker_hv_30", ""),
+            state.get("iv_hv_ratio", ""),
+            state.get("micro_vol_surge", ""),
+            state.get("micro_price_mom_1m", ""),
+            state.get("micro_price_mom_5m", ""),
+            state.get("micro_tick_dir", ""),
         ]
         with open(csv_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -219,6 +231,58 @@ def _vol_proxy_snapshot() -> dict:
     except Exception as e:
         log.debug("grid collector: vol proxy snapshot failed: %s", e)
         return {}
+
+
+def _ticker_volatility_snapshot(ticker: str) -> dict:
+    """Capture 30-day realized historical volatility (HV30) for ticker."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=50)
+        resp = stock_data_client.get_stock_bars(
+            StockBarsRequest(symbol_or_symbols=ticker, timeframe=TimeFrame.Day, start=start, feed="iex")
+        )
+        bars = (resp.data or {}).get(ticker, [])
+        if len(bars) >= 15:
+            import numpy as np
+            closes = [float(b.close) for b in bars]
+            log_rets = np.diff(np.log(closes))
+            hv_30 = float(np.std(log_rets) * np.sqrt(252))
+            return {"ticker_hv_30": round(hv_30, 4)}
+    except Exception as e:
+        log.debug("grid collector: ticker HV snapshot failed for %s: %s", ticker, e)
+    return {}
+
+
+def _microstructure_snapshot(ticker: str) -> dict:
+    """Capture 1-minute order flow volume surge and short-term price momentum."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(minutes=45)
+        resp = stock_data_client.get_stock_bars(
+            StockBarsRequest(symbol_or_symbols=ticker, timeframe=TimeFrame.Minute, start=start, feed="iex")
+        )
+        bars = (resp.data or {}).get(ticker, [])
+        if bars:
+            import numpy as np
+            latest_bar = bars[-1]
+            latest_vol = float(latest_bar.volume)
+            prior_vols = [float(b.volume) for b in bars[:-1]]
+            baseline_vol = float(np.median(prior_vols)) if prior_vols else latest_vol
+            surge = round(latest_vol / max(1.0, baseline_vol), 2)
+
+            mom_1m = round(float(latest_bar.close) / float(latest_bar.open) - 1.0, 4) if latest_bar.open else 0.0
+            mom_5m = round(float(latest_bar.close) / float(bars[-5].open) - 1.0, 4) if len(bars) >= 5 and bars[-5].open else mom_1m
+            tick_dir = 1 if latest_bar.close > latest_bar.open else (-1 if latest_bar.close < latest_bar.open else 0)
+
+            return {
+                "micro_vol_surge": surge,
+                "micro_price_mom_1m": mom_1m,
+                "micro_price_mom_5m": mom_5m,
+                "micro_tick_dir": tick_dir,
+            }
+    except Exception as e:
+        log.debug("grid collector: microstructure snapshot failed for %s: %s", ticker, e)
+    return {}
 
 
 def _current_stock_price(state: dict) -> str:
@@ -342,6 +406,9 @@ async def start_collection(signal_id: str, signal_ts: datetime, ticker: str, sig
             return
 
         regime = await loop.run_in_executor(None, _regime_snapshot)
+        ticker_vol = await loop.run_in_executor(None, _ticker_volatility_snapshot, ticker)
+        micro = await loop.run_in_executor(None, _microstructure_snapshot, ticker)
+
         last_expiry = max(date.fromisoformat(exp) for _, exp, _, _ in contracts_meta.values())
         magnitude = float(signal.get("magnitude", 0))
         confidence = float(signal.get("confidence", 0))
@@ -356,7 +423,9 @@ async def start_collection(signal_id: str, signal_ts: datetime, ticker: str, sig
             "contract_type": contract_type,
             "magnitude": magnitude,
             "confidence": confidence,
-            "catalyst": signal.get("catalyst", ""),
+            "catalyst": str(signal.get("catalyst", "other")).lower().strip(),
+            "is_stale_echo": bool(signal.get("is_stale_echo", False)),
+            "reasoning": str(signal.get("reasoning", "")),
             "stock_price_at_signal": stock_price,
             "spy_price": regime.get("spy_price", ""),
             "spy_sma": regime.get("spy_sma", ""),
@@ -376,12 +445,36 @@ async def start_collection(signal_id: str, signal_ts: datetime, ticker: str, sig
             "get_stock_price": get_stock_price,
         }
 
-        # 1. Write the single metadata row for this signal
-        await loop.run_in_executor(None, _write_signal_row, signal_id, state)
-
-        # 2. Write initial quotes/Greeks snapshot
+        # 1. Fetch initial quotes/Greeks snapshot
         rows = await loop.run_in_executor(None, _snapshot_rows, signal_id, state)
         await loop.run_in_executor(None, _write_snapshot_rows, rows)
+
+        # 2. Extract ATM contract IV from initial snapshot rows to calculate IV/HV ratio
+        atm_iv = ""
+        iv_hv_ratio = ""
+        try:
+            valid_snaps = [r for r in rows if len(r) > 14 and r[14] != ""]
+            if valid_snaps:
+                atm_row = min(valid_snaps, key=lambda r: abs(float(r[6]) - float(stock_price)))
+                atm_iv = float(atm_row[14])
+                hv = ticker_vol.get("ticker_hv_30")
+                if hv and hv > 0 and atm_iv > 0:
+                    iv_hv_ratio = round(atm_iv / hv, 3)
+        except Exception as e:
+            log.debug("grid collector: atm iv derivation failed: %s", e)
+
+        state.update({
+            "atm_iv": atm_iv,
+            "ticker_hv_30": ticker_vol.get("ticker_hv_30", ""),
+            "iv_hv_ratio": iv_hv_ratio,
+            "micro_vol_surge": micro.get("micro_vol_surge", ""),
+            "micro_price_mom_1m": micro.get("micro_price_mom_1m", ""),
+            "micro_price_mom_5m": micro.get("micro_price_mom_5m", ""),
+            "micro_tick_dir": micro.get("micro_tick_dir", ""),
+        })
+
+        # 3. Write the single metadata row for this signal
+        await loop.run_in_executor(None, _write_signal_row, signal_id, state)
 
         _tracked[signal_id] = state
         type_label = "PUT" if contract_type == ContractType.PUT else "CALL"

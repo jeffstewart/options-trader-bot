@@ -356,6 +356,72 @@ async def news_stream_listener():
             await asyncio.sleep(5)
 
 
+async def sec_rss_poller():
+    """Poll SEC EDGAR Atom feed for material 8-K filings and route to pipeline."""
+    if not getattr(cfg, "SEC_FEED_ENABLED", False):
+        return
+
+    import feedparser
+    from v3 import sec_edgar
+
+    log.info("📡 SEC EDGAR 8-K RSS poller started (every %ds)", cfg.SEC_POLL_SECS)
+    async with aiohttp.ClientSession() as session:
+        while _running:
+            try:
+                async with session.get(cfg.SEC_RSS_URL, headers={"User-Agent": cfg.SEC_USER_AGENT},
+                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        raw = await r.text()
+                        feed = feedparser.parse(raw)
+                        cik_map = await sec_edgar.load_cik_ticker_map(session, cfg.SEC_USER_AGENT)
+
+                        for entry in feed.entries:
+                            eid = entry.get("id", entry.get("link", ""))
+                            if not eid or eid in _seen_news_ids:
+                                continue
+                            _seen_news_ids.add(eid)
+
+                            title = entry.get("title", "")
+                            summary = entry.get("summary", "")
+                            link = entry.get("link", "")
+
+                            cik, accession = sec_edgar.extract_cik_accession(link)
+                            ticker = cik_map.get(cik) if cik else None
+                            if not ticker:
+                                continue
+
+                            headline = f"{title} [{ticker}]"
+                            body = summary
+                            if cik and accession and (sec_edgar.item_codes_in_summary(summary) & sec_edgar.MATERIAL_ITEMS):
+                                try:
+                                    full_text = await sec_edgar.fetch_8k_content(session, cik, accession, cfg.SEC_USER_AGENT)
+                                    if full_text:
+                                        body = full_text
+                                except Exception as e:
+                                    log.debug("SEC 8-K content fetch failed for %s: %s", eid, e)
+
+                            # Store article in SQLite archive
+                            news_item = {
+                                "id": eid,
+                                "headline": headline,
+                                "summary": body,
+                                "symbols": [ticker],
+                                "source": "SEC",
+                                "url": link,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            news_db.store_article(news_item)
+
+                            log.info("📰 [SEC EDGAR 8-K] %s (%s)", headline[:80], ticker)
+                            asyncio.create_task(
+                                process_signal(headline, body, "SEC", [ticker], datetime.now(timezone.utc), eid)
+                            )
+            except Exception as e:
+                log.warning("SEC RSS poll exception: %s", e)
+
+            await asyncio.sleep(cfg.SEC_POLL_SECS)
+
+
 async def position_monitor_loop():
     """Periodically evaluate open positions for timed horizon exits."""
     log.info("Starting position monitor (horizon exit = %d min) ...", cfg.EXIT_HORIZON_MINUTES)
@@ -421,6 +487,9 @@ async def main():
         tasks.append(news_stream_listener())
     else:
         tasks.append(news_poller())
+
+    if getattr(cfg, "SEC_FEED_ENABLED", True):
+        tasks.append(sec_rss_poller())
 
     await asyncio.gather(*tasks)
 
